@@ -577,3 +577,14 @@ Düzeltmeler bu sunucuda **~4,1×**, laptop'a göre **~2,4×** dizi verimi getir
 **Koşu:** tmux `egitim` oturumunda, log `training/faz3_log.txt` (ekleme modunda). 0,86–0,90 sn/adım (GPU %100) → ~17,5 saat. İlk ölçüm: adım 500'de doğrulama kaybı **3,109**.
 
 **Not — daha fazla hız:** GPU artık %100 meşgul; sonraki kazanç çekirdek verimidir (GEMM ~3,3 TFLOPS, L4 f32 tepe ~30). Koşu checkpoint'ten devam edebildiği için hızlandırılmış çekirdeklere koşu ortasında geçilebilir.
+
+## 23. Faz 3b — Bağlam 128 → 1024 (2026-09-26, adım 26.000)
+
+**Karar (kullanıcı ile):** Eğitimin kalanı 1024 bağlamla. Standart "kısa bağlamla eğit, sonra uzat" yaklaşımı; RAG ve paragraf düzeyinde tutarlılık için ön koşul.
+
+- `train_lm_gpu.c`: `SEQ_LEN` 128 → **1024**, `BATCH_SEQS` 112 → **14** — adım başına token (14.336), lr takvimi ve toplam token bütçesi DEĞİŞMEDİ. Ağırlıklar bağlam uzunluğundan bağımsız (RoPE her pozisyonda çalışır) → 26.000. adım checkpoint'inden doğrudan devam.
+- `tests/test_gpu_train.c`'ye **Vaka 3 (T=1024)** eklendi (V=500 D=64 H=2 L=2 F=128 B=2): kayıp ve gradyanlar CPU referansıyla eşleşiyor (en kötü göreli fark 2e-6) — uzun satırlı softmax (T > blok boyutu), T×T batch'li GEMM, 1023'e kadar RoPE pozisyonları sınandı. Toplam **193/193**.
+- `generate.c`/`chat.c`: `CTX_MAX` 1024, adım arenası 8 GB (mmap tembel ayırır).
+- Geçiş: eğitim 26.000. adımın checkpoint'i yazılır yazılmaz durduruldu (adım kaybı yok). 128 bağlamlı en iyi model `lm_wiki_faz3_best_ctx128.bin` olarak saklandı (doğrulama kaybı 1,679); 1024 bağlamlı doğrulama kaybı farklı ölçekte olduğu için "en iyi" takibi sıfırlandı.
+
+**Ölçümler:** 1,15 sn/adım (128'de 0,90; tahmin 1,1–1,3), GPU belleği 11,5 GB. Geçişte kısa bir sıçrama (26.100: 1,896), 26.200'de eğitim kaybı 1,726 (128 bağlamdaki son değer ~1,80). **İlk 1024 doğrulama kaybı (26.500): 1,548** (128 bağlamda 1,679) — model uzun bağlamdan hemen faydalandı. Kalan ~43.500 adım ≈ 14 saat.

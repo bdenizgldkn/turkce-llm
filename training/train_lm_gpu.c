@@ -27,7 +27,12 @@
 #define NUM_HEADS    6u
 #define NUM_LAYERS   12u
 #define D_FF         1024u
-#define SEQ_LEN      128u
+/* Faz 3b (PROJE_PLANI.md Bolum 23): adim 26.000'den itibaren baglam
+ * 128 -> 1024. Adim basina token sayisi AYNI tutuldu (112x128 = 14x1024
+ * = 14.336) -> lr takvimi ve toplam token butcesi degismez. Agirliklar
+ * baglam uzunlugundan bagimsiz (RoPE her pozisyonda calisir), bu yuzden
+ * 128 baglamli checkpoint'ten dogrudan devam edilir. */
+#define SEQ_LEN      1024u
 #define EPS          1e-5f
 
 /* Faz 3 (bkz. PROJE_PLANI.md Bolum 22): isinma + kosinus lr, gradyan
@@ -52,8 +57,8 @@
 #define BEST_VAL_PATH    "checkpoints/lm_wiki_faz3_best_val.bin" /* en iyi dogrulama kaybi (f32), devamda korunur */
 #define CKPT_PROBE_PATH  "checkpoints/.yazma_testi"
 
-/* Adim basina dizi sayisi (Faz 2 / train_lm.c: 28). */
-#define BATCH_SEQS 112u
+/* Adim basina dizi sayisi (Faz 2: 28 x 128; Faz 3: 112 x 128; Faz 3b: 14 x 1024). */
+#define BATCH_SEQS 14u
 #define MAX_PARAMS  (LM_MAX_LAYERS * 12u + 2u)
 
 

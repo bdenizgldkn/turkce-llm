@@ -36,7 +36,7 @@
 #define NUM_HEADS    6u
 #define NUM_LAYERS   12u
 #define D_FF         1024u
-#define CTX_MAX      128u
+#define CTX_MAX      1024u /* Faz 3b: model 1024 baglamla egitildi */
 #define EPS          1e-5f
 
 #define NUM_GENERATE   80u
@@ -139,7 +139,7 @@ static void generate_from_seed(const TokenizerVocab* voc, LMModel* model, PCGSta
         u32 cur_len = (context_len < CTX_MAX) ? context_len : CTX_MAX;
         const u32* window_ids = context + (context_len - cur_len);
 
-        Allocator step_alloc = allocator_create(768ull * 1024 * 1024);
+        Allocator step_alloc = allocator_create(8ull * 1024 * 1024 * 1024); /* 1024 baglamda dikkat matrisleri buyuk; mmap tembel ayirir */
 
         u64 cshape[2] = { cur_len, head_dim / 2 };
         Tensor cos_t = tensor_create(&step_alloc, cshape, 2);

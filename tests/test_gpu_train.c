@@ -254,6 +254,10 @@ int main(void) {
                       50, 32, 2, 2, 48, 12, 5, 4000, 0 };
     run_case(&small);
 
+    CaseCfg longctx = { "Vaka 3: uzun baglam (V=500 D=64 H=2 L=2 F=128 T=1024 B=2)",
+                        500, 64, 2, 2, 128, 1024, 2, 20000, 0 };
+    run_case(&longctx);
+
     CaseCfg real = { "Vaka 2: gercek olcek (V=31769 D=384 H=6 L=12 F=1024 T=128 B=4)",
                      31769, 384, 6, 12, 1024, 128, 4, 200000, 1 };
     run_case(&real);
