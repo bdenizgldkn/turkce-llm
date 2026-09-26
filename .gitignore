@@ -1,0 +1,27 @@
+# Buyuk / yeniden uretilebilir veri (bkz. PROJE_PLANI.md Bolum 12)
+data/raw/*.xml
+data/raw/*.bz2
+data/raw/*.bin
+data/raw/wikipedia_corpus.txt
+data/raw/tokenize_log.txt
+
+# Egitim ciktilari
+checkpoints/
+*.bin
+*.tmp
+training/*.txt
+
+# Derlenmis programlar (uzantisiz ELF) ve Windows ciktilari
+*.exe
+*.o
+tests/*
+!tests/*.c
+training/*
+!training/*.c
+!training/*.h
+tokenizer/*
+!tokenizer/*.c
+!tokenizer/*.h
+
+# Yedekler
+*.bak
