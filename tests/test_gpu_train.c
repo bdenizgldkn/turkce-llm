@@ -22,6 +22,7 @@
 #include "../model/gpu_train.h"
 #include "../training/adam.h"
 #include "../training/data_parallel.h"
+#include "../runtime/mathlib.h"
 
 static u32 g_pass = 0;
 static u32 g_fail = 0;
@@ -144,6 +145,26 @@ static void run_case(const CaseCfg* c) {
     }
     CHECK(same, "gpu_train: ayni girdiyle iki kosu BIT BIT ayni degil (determinizm)");
 
+    /* Dogrulama kaybi (sadece ileri) == egitim adimindaki kayip, BIT BIT */
+    {
+        f32 ev = gpu_trainer_eval_loss(&g, ids, tgt);
+        union { f32 f; u32 u; } ea, eb; ea.f = ev; eb.f = gpu_loss2;
+        CHECK(ea.u == eb.u, "gpu_train: eval_loss ileri-geri kaybiyla bit bit ayni degil");
+    }
+
+    /* Gradyan normu: GPU (deterministik blok indirgemesi) vs CPU (f64, g1 = GPU gradyanlari) */
+    {
+        f64 ss = 0.0;
+        for (u32 i = 0; i < np; i++) for (u64 k = 0; k < g1[i].numel; k++) ss += (f64)g1[i].data[k] * (f64)g1[i].data[k];
+        f64 cpu_norm = m_sqrt(ss);
+        f64 gpu_norm = gpu_trainer_grad_norm(&g);
+        f64 rel = (gpu_norm - cpu_norm) / cpu_norm; if (rel < 0) rel = -rel;
+        write_e6("  gradyan normu goreli farki: ", rel); console_write_line("");
+        CHECK(rel < 1e-5, "gpu_train: gradyan normu CPU ile eslesmiyor");
+        f64 gpu_norm2 = gpu_trainer_grad_norm(&g);
+        CHECK(gpu_norm == gpu_norm2, "gpu_train: gradyan normu deterministik degil");
+    }
+
     /* Adam: CPU referans gradyanlariyla CPU Adam vs GPU gradyanlariyla GPU Adam */
     for (u32 i = 0; i < np; i++)
         for (u64 k = 0; k < ref_grad[i].numel; k++) params[i]->grad.data[k] = ref_grad[i].data[k];
@@ -181,6 +202,44 @@ static void run_case(const CaseCfg* c) {
     bool32 rt = TRUE;
     for (u64 k = 0; k < snap.numel; k++) if (snap.data[k] != params[0]->value.data[k]) { rt = FALSE; break; }
     CHECK(rt, "gpu_train: upload/download gidis-donusu kayipli");
+
+    /* Olcekli Adam (kirpma): adam_step_scaled(0.5) ile G == adam_step ile 0.5*G,
+     * ayni baslangic durumundan BIT BIT (0.5 ile carpim tam). */
+    {
+        Tensor sv[LM_MAX_LAYERS * 12 + 2], sm[LM_MAX_LAYERS * 12 + 2], svv[LM_MAX_LAYERS * 12 + 2], resA[LM_MAX_LAYERS * 12 + 2];
+        for (u32 i = 0; i < np; i++) {
+            sv[i] = tensor_create(&alloc, params[i]->value.shape, params[i]->value.ndim);
+            sm[i] = tensor_create(&alloc, params[i]->value.shape, params[i]->value.ndim);
+            svv[i] = tensor_create(&alloc, params[i]->value.shape, params[i]->value.ndim);
+            resA[i] = tensor_create(&alloc, params[i]->value.shape, params[i]->value.ndim);
+            for (u64 k = 0; k < sv[i].numel; k++) { sv[i].data[k] = params[i]->value.data[k]; sm[i].data[k] = gopt.m[i].data[k]; svv[i].data[k] = gopt.v[i].data[k]; }
+        }
+        u64 t0 = gopt.t;
+
+        /* A: gradyan = 0.5*G, olceksiz Adam */
+        for (u32 i = 0; i < np; i++) for (u64 k = 0; k < ref_grad[i].numel; k++) params[i]->grad.data[k] = 0.5f * ref_grad[i].data[k];
+        gpu_trainer_upload_grads(&g, params);
+        gpu_trainer_adam_step(&g, &gopt);
+        gpu_trainer_download(&g, params, &gopt);
+        for (u32 i = 0; i < np; i++) for (u64 k = 0; k < resA[i].numel; k++) resA[i].data[k] = params[i]->value.data[k];
+
+        /* B: ayni baslangic durumu, gradyan = G, olcek 0.5 */
+        for (u32 i = 0; i < np; i++) for (u64 k = 0; k < sv[i].numel; k++) { params[i]->value.data[k] = sv[i].data[k]; gopt.m[i].data[k] = sm[i].data[k]; gopt.v[i].data[k] = svv[i].data[k]; }
+        gopt.t = t0;
+        gpu_trainer_upload(&g, params, &gopt);
+        for (u32 i = 0; i < np; i++) for (u64 k = 0; k < ref_grad[i].numel; k++) params[i]->grad.data[k] = ref_grad[i].data[k];
+        gpu_trainer_upload_grads(&g, params);
+        gpu_trainer_adam_step_scaled(&g, &gopt, 0.5f);
+        gpu_trainer_download(&g, params, &gopt);
+
+        bool32 eq = TRUE;
+        for (u32 i = 0; i < np && eq; i++) {
+            const u32* a = (const u32*)resA[i].data;
+            const u32* b = (const u32*)params[i]->value.data;
+            for (u64 k = 0; k < resA[i].numel; k++) if (a[k] != b[k]) { eq = FALSE; break; }
+        }
+        CHECK(eq, "gpu_train: adam_step_scaled(0.5, G) != adam_step(0.5*G)");
+    }
 
     gpu_trainer_destroy(&g);
     if (c->cpu_use_gpu) gpu_ops_shutdown();

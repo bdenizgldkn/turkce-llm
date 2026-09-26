@@ -28,6 +28,7 @@
 #include "../training/adam.h"
 
 #define GPU_TRAIN_MAX_PARAMS (LM_MAX_LAYERS * 10u + 2u)
+#define GPU_TRAIN_NORM_BLOCKS 1024u
 
 typedef struct GpuLayerActs {
     CUdeviceptr x_in;   /* [N,D] katman girdisi (residual) */
@@ -53,7 +54,7 @@ typedef struct GpuTrainer {
     CUfunction k_heads_merge, k_heads_split;
     CUfunction k_swiglu_fwd, k_swiglu_bwd;
     CUfunction k_embed_fwd, k_embed_bwd;
-    CUfunction k_cross_entropy, k_adam;
+    CUfunction k_cross_entropy, k_adam, k_sumsq_partial;
 
     u32 V, D, H, L, F, T, B, N, hd;
     f32 eps;
@@ -73,6 +74,8 @@ typedef struct GpuTrainer {
 
     CUdeviceptr ids, targets, loss_rows, cos_t, sin_t;
     f32* host_loss_rows; /* [N] */
+    CUdeviceptr norm_partial; /* [GPU_TRAIN_NORM_BLOCKS] */
+    f32* host_norm_partial;
 } GpuTrainer;
 
 /* model'in mimarisiyle (V, D, H, L, F, eps) B dizi x T token'lik adimlar
@@ -104,7 +107,20 @@ void gpu_trainer_sample_batch(const u32* tokens, u64 num_tokens, u32 seq_len, u3
  * data_parallel_step ile ayni tanim). Gradyanlar da ayni ortalamadir. */
 f32 gpu_trainer_forward_backward(GpuTrainer* g, const u32* ids, const u32* targets);
 
+/* Sadece ileri yayilim + kayip (gradyanlara dokunmaz): dogrulama kaybi
+ * icin. Ayni girdiyle gpu_trainer_forward_backward'in dondurdugu kayipla
+ * BIT BIT aynidir (ayni ileri yol). */
+f32 gpu_trainer_eval_loss(GpuTrainer* g, const u32* ids, const u32* targets);
+
+/* Mevcut gradyanlarin global L2 normu (deterministik). */
+f64 gpu_trainer_grad_norm(GpuTrainer* g);
+
 /* opt->t'yi artirip GPU'da Adam adimi atar (hiperparametreler opt'tan). */
 void gpu_trainer_adam_step(GpuTrainer* g, AdamOptimizer* opt);
+
+/* Ayni, ama gradyanlar once grad_scale ile carpilir (gradyan kirpma:
+ * grad_scale = min(1, max_norm / norm)). grad_scale=1 -> adam_step ile
+ * birebir ayni. */
+void gpu_trainer_adam_step_scaled(GpuTrainer* g, AdamOptimizer* opt, f32 grad_scale);
 
 #endif /* MODEL_GPU_TRAIN_H */

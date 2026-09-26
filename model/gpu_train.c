@@ -128,6 +128,7 @@ GpuTrainer gpu_trainer_create(Allocator* alloc, const char* ptx_path, const LMMo
     g.k_embed_bwd = cuda_get_kernel(&g.cuda, "k_embed_bwd");
     g.k_cross_entropy = cuda_get_kernel(&g.cuda, "k_cross_entropy");
     g.k_adam = cuda_get_kernel(&g.cuda, "k_adam");
+    g.k_sumsq_partial = cuda_get_kernel(&g.cuda, "k_sumsq_partial");
 
     /* Parametre yerlesimi: lm_collect_params sirasiyla tek duz tampon. */
     g.num_params = num_params;
@@ -183,6 +184,8 @@ GpuTrainer gpu_trainer_create(Allocator* alloc, const char* ptx_path, const LMMo
     g.targets = cuda_alloc(N * sizeof(u32));
     g.loss_rows = dalloc(N);
     g.host_loss_rows = (f32*)allocator_alloc(alloc, N * F4);
+    g.norm_partial = dalloc(GPU_TRAIN_NORM_BLOCKS);
+    g.host_norm_partial = (f32*)allocator_alloc(alloc, GPU_TRAIN_NORM_BLOCKS * F4);
 
     /* RoPE tablolari (CPU'daki rope_build_tables ile ayni) */
     u64 cshape[2] = { T, g.hd / 2 };
@@ -256,7 +259,8 @@ void gpu_trainer_sample_batch(const u32* tokens, u64 num_tokens, u32 seq_len, u3
 
 /* ---------------- ileri + geri ---------------- */
 
-f32 gpu_trainer_forward_backward(GpuTrainer* g, const u32* ids, const u32* targets) {
+/* Ileri yayilim + capraz-entropi. Sonunda g->logits = dL/dlogits. */
+static void gpu_forward(GpuTrainer* g, const u32* ids, const u32* targets) {
     cuda_set_current(&g->cuda);
     i32 N = (i32)g->N, D = (i32)g->D, F = (i32)g->F, T = (i32)g->T, V = (i32)g->V;
     i32 Bi = (i32)g->B, Hi = (i32)g->H, hd = (i32)g->hd;
@@ -267,7 +271,6 @@ f32 gpu_trainer_forward_backward(GpuTrainer* g, const u32* ids, const u32* targe
 
     cuda_h2d(g->ids, ids, (u64)N * sizeof(u32));
     cuda_h2d(g->targets, targets, (u64)N * sizeof(u32));
-    cuda_memset_zero(g->grads, g->total_scalars * F4);
 
     /* ===== ileri ===== */
     {
@@ -328,6 +331,19 @@ f32 gpu_trainer_forward_backward(GpuTrainer* g, const u32* ids, const u32* targe
         void* args[] = { &lg, &tg, &lr, &V, &grad_scale };
         launch_rows(g->k_cross_entropy, (u32)N, 256, args);
     }
+
+}
+
+/* gpu_forward()'un biraktigi dL/dlogits'ten tum parametre gradyanlarina
+ * (g->grads'a EKLER -- cagiran once sifirlamalidir). */
+static void gpu_backward(GpuTrainer* g) {
+    i32 N = (i32)g->N, D = (i32)g->D, F = (i32)g->F, T = (i32)g->T, V = (i32)g->V;
+    i32 Bi = (i32)g->B, Hi = (i32)g->H, hd = (i32)g->hd;
+    u32 BH = g->B * g->H;
+    i64 sTT = (i64)T * T, sThd = (i64)T * hd;
+    f32 scale = 1.0f / m_sqrtf((f32)g->hd);
+    u32 att_threads = pow2_threads(g->T);
+    u32 p_final = pidx(g->L, 0);
 
     /* ===== geri ===== */
     /* logits artik dL/dlogits. dE += dlogits^T @ nf ; dnf = dlogits @ E */
@@ -393,9 +409,12 @@ f32 gpu_trainer_forward_backward(GpuTrainer* g, const u32* ids, const u32* targe
         launch_1d(g->k_embed_bwd, (u64)D, args);
     }
 
-    /* Kayip: dizi-ici ortalama, sonra diziler uzerinden ortalama
-     * (data_parallel_step ile ayni tanim). */
-    cuda_d2h(g->host_loss_rows, g->loss_rows, (u64)N * F4); /* senkron -> tum cekirdekler bitti */
+}
+
+/* Kayip: dizi-ici ortalama, sonra diziler uzerinden ortalama
+ * (data_parallel_step ile ayni tanim). */
+static f32 mean_loss(GpuTrainer* g) {
+    cuda_d2h(g->host_loss_rows, g->loss_rows, (u64)g->N * F4); /* senkron -> tum cekirdekler bitti */
     f32 loss_sum = 0.0f;
     for (u32 b = 0; b < g->B; b++) {
         f32 s = 0.0f;
@@ -405,7 +424,36 @@ f32 gpu_trainer_forward_backward(GpuTrainer* g, const u32* ids, const u32* targe
     return loss_sum / (f32)g->B;
 }
 
+f32 gpu_trainer_forward_backward(GpuTrainer* g, const u32* ids, const u32* targets) {
+    cuda_set_current(&g->cuda);
+    cuda_memset_zero(g->grads, g->total_scalars * F4);
+    gpu_forward(g, ids, targets);
+    gpu_backward(g);
+    return mean_loss(g);
+}
+
+f32 gpu_trainer_eval_loss(GpuTrainer* g, const u32* ids, const u32* targets) {
+    gpu_forward(g, ids, targets);
+    return mean_loss(g);
+}
+
+f64 gpu_trainer_grad_norm(GpuTrainer* g) {
+    cuda_set_current(&g->cuda);
+    CUdeviceptr x = g->grads, part = g->norm_partial;
+    i64 n = (i64)g->total_scalars;
+    void* args[] = { &x, &n, &part };
+    cuda_launch(g->k_sumsq_partial, GPU_TRAIN_NORM_BLOCKS, 1, 1, THREADS_1D, 1, 1, 0, args);
+    cuda_d2h(g->host_norm_partial, g->norm_partial, GPU_TRAIN_NORM_BLOCKS * F4);
+    f64 ss = 0.0;
+    for (u32 i = 0; i < GPU_TRAIN_NORM_BLOCKS; i++) ss += (f64)g->host_norm_partial[i];
+    return m_sqrt(ss);
+}
+
 void gpu_trainer_adam_step(GpuTrainer* g, AdamOptimizer* opt) {
+    gpu_trainer_adam_step_scaled(g, opt, 1.0f);
+}
+
+void gpu_trainer_adam_step_scaled(GpuTrainer* g, AdamOptimizer* opt, f32 grad_scale) {
     cuda_set_current(&g->cuda);
     opt->t++;
     f32 bc1 = 1.0f - m_powf(opt->beta1, (f32)opt->t);
@@ -413,7 +461,7 @@ void gpu_trainer_adam_step(GpuTrainer* g, AdamOptimizer* opt) {
     CUdeviceptr p = g->params, gr = g->grads, m = g->adam_m, v = g->adam_v;
     i64 n = (i64)g->total_scalars;
     f32 lr = opt->lr, b1 = opt->beta1, b2 = opt->beta2, eps = opt->eps;
-    void* args[] = { &p, &gr, &m, &v, &n, &lr, &b1, &b2, &eps, &bc1, &bc2 };
+    void* args[] = { &p, &gr, &m, &v, &n, &lr, &b1, &b2, &eps, &bc1, &bc2, &grad_scale };
     launch_1d(g->k_adam, (u64)n, args);
     cuda_sync();
 }

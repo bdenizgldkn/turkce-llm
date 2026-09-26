@@ -497,12 +497,25 @@ extern "C" __global__ void k_cross_entropy(float* logits, const unsigned int* ta
     }
 }
 
+/* Kareler toplaminin blok-kismi toplamlari (gradyan normu icin). Sabit
+ * grid + izgara-adimli dongu + sabit sirali blok indirgemesi ->
+ * deterministik; host partial[]'i sirayla (f64) toplar. */
+extern "C" __global__ void k_sumsq_partial(const float* x, long long n, float* partial) {
+    __shared__ float buf[RED_THREADS];
+    float s = 0.0f;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+        s += x[i] * x[i];
+    s = block_sum(s, buf);
+    if (threadIdx.x == 0) partial[blockIdx.x] = s;
+}
+
 /* Adam (training/adam.c adam_update_one ile ayni formul), duz dizi. */
 extern "C" __global__ void k_adam(float* p, const float* g, float* m, float* v, long long n,
-                                  float lr, float b1, float b2, float eps, float bc1, float bc2) {
+                                  float lr, float b1, float b2, float eps, float bc1, float bc2,
+                                  float grad_scale) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float gi = g[i];
+    float gi = g[i] * grad_scale; /* gradyan kirpma olcegi (kirpma yoksa 1.0 -> birebir ayni) */
     float mi = b1 * m[i] + (1.0f - b1) * gi;
     float vi = b2 * v[i] + (1.0f - b2) * gi * gi;
     m[i] = mi;

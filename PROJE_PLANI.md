@@ -559,3 +559,21 @@ Düzeltmeler bu sunucuda **~4,1×**, laptop'a göre **~2,4×** dizi verimi getir
 - 3000 adımlık Faz 2 koşusu ≈ **11,5 dakika** (CPU: ~6,4 saat).
 
 **Olası sonraki kazanımlar (denenmedi):** GEMM verimi (L4 f32 tepe ~30 TFLOPS; şu an ~%11 — daha büyük karo/çift tamponlama), adım başına dizi sayısını artırmak (GPU belleği bol: ~3 GB kullanılıyor), çapraz-entropide logits'i tek geçişte işlemek.
+
+## 22. Faz 3 — Uzun GPU Eğitim Koşusu (2026-09-26)
+
+**Karar (kullanıcı ile):** CPU eğitimi (adım 700'de) durduruldu; modelin kapasitesine göre makul hedef hesaplandı: veri 494,6M token, Chinchilla-optimal ≈ 20 token/parametre ≈ 670M token; ~4 epoch'a kadar tekrar faydalı. Seçilen hedef **~1 milyar token (~2 epoch) = 70.000 adım × 14.336 token**.
+
+**`training/train_lm_gpu.c` Faz 3 yapılandırması:**
+- **Batch 112 dizi** (Faz 2: 28) — 14.336 token/adım; GPU belleği ~7,7 GB.
+- **Öğrenme hızı takvimi** (`training/lr_schedule.c`): 1000 adım doğrusal ısınma → kosinüs ile 6e-4'ten 6e-5'e (70.000. adımda). Sadece adım numarasının fonksiyonu → devam eden koşu aynı lr'yi kullanır. `tests/test_lr_schedule.c` 9/9.
+- **Gradyan kırpma**, global L2 norm 1.0: `k_sumsq_partial` (sabit grid, sabit sıralı indirgeme → deterministik) + `k_adam`'a `grad_scale` parametresi (1.0 ile eski davranışla birebir).
+- **Doğrulama seti:** token dizisinin **son %1'i** (4.946.039 token, bitişik blok — rastgele pencereler bitişik olduğundan rastgele ayrım sızıntı yaratırdı); eğitim pencereleri sadece ilk %99'dan. 500 adımda bir, doğrulama bloğunda eşit aralıklı SABİT 8×112 pencerede sadece-ileri kayıp (`gpu_trainer_eval_loss`).
+- **Checkpoint'ler:** `lm_wiki_faz3_latest.bin` (1000 adımda bir), `lm_wiki_faz3_best.bin` (en düşük doğrulama kaybı; değeri `lm_wiki_faz3_best_val.bin`'de, devamda korunur), `lm_wiki_faz3_final.bin`. Faz 2 dosyalarından ayrı (yanlışlıkla eski checkpoint'ten devam edilmesin).
+- `gpu_train.c`: ileri/geri ayrıldı (`gpu_forward`/`gpu_backward`); `gpu_trainer_eval_loss`, `gpu_trainer_grad_norm`, `gpu_trainer_adam_step_scaled` eklendi.
+
+**Doğrulama (`tests/test_gpu_train.c`, 162/162):** önceki 154 kontrole ek olarak: eval kaybı ileri-geri kaybıyla bit bit aynı; GPU gradyan normu CPU (f64) ile aynı ve deterministik; `adam_step_scaled(0.5, G)` == `adam_step(0.5·G)` bit bit.
+
+**Koşu:** tmux `egitim` oturumunda, log `training/faz3_log.txt` (ekleme modunda). 0,86–0,90 sn/adım (GPU %100) → ~17,5 saat. İlk ölçüm: adım 500'de doğrulama kaybı **3,109**.
+
+**Not — daha fazla hız:** GPU artık %100 meşgul; sonraki kazanç çekirdek verimidir (GEMM ~3,3 TFLOPS, L4 f32 tepe ~30). Koşu checkpoint'ten devam edebildiği için hızlandırılmış çekirdeklere koşu ortasında geçilebilir.

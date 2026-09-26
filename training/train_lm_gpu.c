@@ -20,6 +20,7 @@
 #include "../model/gpu_train.h"
 #include "../training/adam.h"
 #include "../training/checkpoint.h"
+#include "../training/lr_schedule.h"
 
 #define VOCAB_SIZE   31769u
 #define D_MODEL      384u
@@ -29,21 +30,30 @@
 #define SEQ_LEN      128u
 #define EPS          1e-5f
 
-#define LR           3e-4f
+/* Faz 3 (bkz. PROJE_PLANI.md Bolum 22): isinma + kosinus lr, gradyan
+ * kirpma, %1 dogrulama seti, 112 dizi/adim, ~1 milyar token (~2 epoch). */
+#define PEAK_LR      6e-4f
+#define MIN_LR       6e-5f
+#define WARMUP_STEPS 1000u
+#define GRAD_CLIP    1.0
 #define BETA1        0.9f
 #define BETA2        0.999f
 #define ADAM_EPS     1e-8f
 
-#define NUM_STEPS       3000u
-#define LOG_EVERY       20u
-#define CKPT_EVERY      250u
-#define CKPT_LATEST_PATH "checkpoints/lm_wiki_faz2_latest.bin"
-#define CKPT_FINAL_PATH  "checkpoints/lm_wiki_faz2_final.bin"
+#define NUM_STEPS       70000u
+#define LOG_EVERY       100u
+#define CKPT_EVERY      1000u
+#define EVAL_EVERY      500u
+#define VAL_PERMILLE    10u   /* token dizisinin SON %1'i dogrulama: egitimde hic gorulmez */
+#define VAL_BATCHES     8u    /* dogrulama: VAL_BATCHES x BATCH_SEQS sabit pencere */
+#define CKPT_LATEST_PATH "checkpoints/lm_wiki_faz3_latest.bin"
+#define CKPT_FINAL_PATH  "checkpoints/lm_wiki_faz3_final.bin"
+#define CKPT_BEST_PATH   "checkpoints/lm_wiki_faz3_best.bin"
+#define BEST_VAL_PATH    "checkpoints/lm_wiki_faz3_best_val.bin" /* en iyi dogrulama kaybi (f32), devamda korunur */
 #define CKPT_PROBE_PATH  "checkpoints/.yazma_testi"
 
-/* Adim basina dizi sayisi: train_lm.c'deki NUM_WORKERS ile ayni tutuldu
- * (ayni efektif batch, kayip egrileri karsilastirilabilir). */
-#define BATCH_SEQS 28u
+/* Adim basina dizi sayisi (Faz 2 / train_lm.c: 28). */
+#define BATCH_SEQS 112u
 #define MAX_PARAMS  (LM_MAX_LAYERS * 12u + 2u)
 
 
@@ -106,6 +116,14 @@ int main(void) {
         return 1;
     }
 
+    /* Egitim/dogrulama ayrimi: son %VAL_PERMILLE/10'luk BITISIK blok
+     * dogrulama (rastgele pencereler bitisik oldugu icin rastgele bir
+     * ayrim sizinti yaratirdi). Egitim pencereleri sadece [0, train_tokens). */
+    u64 val_tokens = num_tokens * VAL_PERMILLE / 1000u;
+    u64 train_tokens = num_tokens - val_tokens;
+    console_write("Egitim token: "); console_write_u64(train_tokens);
+    console_write(" | dogrulama token: "); console_write_u64(val_tokens); console_write_line("");
+
     /* --- 3) Modeli olustur --- */
     PCGState model_rng = pcg_seed(1337, 1);
     LMModel model = lm_init(&persist, &model_rng, VOCAB_SIZE, D_MODEL, NUM_HEADS, NUM_LAYERS, D_FF, EPS);
@@ -119,7 +137,7 @@ int main(void) {
     console_write_line("");
 
     /* --- 4) Adam optimizer --- */
-    AdamOptimizer opt = adam_create(&persist, params, num_params, LR, BETA1, BETA2, ADAM_EPS);
+    AdamOptimizer opt = adam_create(&persist, params, num_params, PEAK_LR, BETA1, BETA2, ADAM_EPS);
 
     /* --- 4b) Varsa CKPT_LATEST_PATH'ten devam et. Adam durumu (m, v, t)
      * da geri yuklenir ve her adimin veri tohumu (2026+step) sadece adim
@@ -155,6 +173,16 @@ int main(void) {
         }
     }
 
+    /* En iyi dogrulama kaybi (devamda korunur; yoksa +sonsuz). */
+    f32 best_val = 3.0e38f;
+    {
+        u64 sz = 0;
+        Allocator bv_scratch = allocator_create(1024 * 1024);
+        f32* bv = (f32*)file_read_entire(BEST_VAL_PATH, &bv_scratch, &sz);
+        if (bv != NULL_PTR && sz == sizeof(f32)) best_val = *bv;
+        allocator_destroy(&bv_scratch);
+    }
+
     /* --- 4c) GPU egiticisi: agirliklar + Adam durumu (devamda
      * checkpoint'ten yuklenmis haliyle) GPU'ya yuklenir. --- */
     GpuTrainer gt = gpu_trainer_create(&persist, "cuda/train_kernels.ptx", &model, params, num_params,
@@ -163,6 +191,11 @@ int main(void) {
     u32* batch_ids = (u32*)allocator_alloc(&persist, (u64)BATCH_SEQS * SEQ_LEN * sizeof(u32));
     u32* batch_tgt = (u32*)allocator_alloc(&persist, (u64)BATCH_SEQS * SEQ_LEN * sizeof(u32));
     console_write_line("GPU egiticisi hazir (agirliklar, gradyanlar, Adam durumu ve aktivasyonlar GPU'da).");
+
+    /* Dogrulama pencereleri: dogrulama blogunda esit aralikli, SABIT
+     * (her olcum ayni pencerelerde -> karsilastirilabilir). */
+    u64 val_windows = (u64)VAL_BATCHES * BATCH_SEQS;
+    u64 val_stride = (val_tokens - SEQ_LEN - 1) / val_windows;
 
     /* --- 5) Egitim dongusu (GPU) --- */
     f64 loss_ema = -1.0;
@@ -173,11 +206,15 @@ int main(void) {
 
     for (u32 step = start_step; step < NUM_STEPS; step++) {
         f64 ta = timer_now_seconds();
-        gpu_trainer_sample_batch(tokens, num_tokens, SEQ_LEN, BATCH_SEQS, 2026ull + step, batch_ids, batch_tgt);
+        opt.lr = lr_warmup_cosine(step, WARMUP_STEPS, NUM_STEPS, PEAK_LR, MIN_LR);
+        gpu_trainer_sample_batch(tokens, train_tokens, SEQ_LEN, BATCH_SEQS, 2026ull + step, batch_ids, batch_tgt);
         f32 loss_val = gpu_trainer_forward_backward(&gt, batch_ids, batch_tgt);
         f64 tb = timer_now_seconds(); t_fb_acc += (tb - ta);
 
-        gpu_trainer_adam_step(&gt, &opt);
+        /* Gradyan kirpma: global L2 normu GRAD_CLIP'i asarsa olcekle. */
+        f64 grad_norm = gpu_trainer_grad_norm(&gt);
+        f32 clip_scale = (grad_norm > GRAD_CLIP) ? (f32)(GRAD_CLIP / grad_norm) : 1.0f;
+        gpu_trainer_adam_step_scaled(&gt, &opt, clip_scale);
         f64 tc = timer_now_seconds(); t_adam_acc += (tc - tb);
 
         loss_ema = (loss_ema < 0.0) ? (f64)loss_val : (0.98 * loss_ema + 0.02 * (f64)loss_val);
@@ -191,6 +228,8 @@ int main(void) {
             console_write(" | ema="); write_fixed3(loss_ema);
             console_write(" | gecen="); write_fixed3(elapsed); console_write(" sn");
             console_write(" | sn/adim="); write_fixed3(interval_elapsed / (f64)steps_in_interval);
+            console_write(" | lr*1e4="); write_fixed3((f64)opt.lr * 1e4);
+            console_write(" | gnorm="); write_fixed3(grad_norm);
             console_write_line("");
             console_write("  [dokum] ileri+geri="); write_fixed3(t_fb_acc);
             console_write("sn adam="); write_fixed3(t_adam_acc);
@@ -198,6 +237,39 @@ int main(void) {
             console_write_line("");
             last_log_elapsed = elapsed;
             t_fb_acc = 0.0; t_adam_acc = 0.0;
+        }
+
+        if ((step + 1) % EVAL_EVERY == 0 || step == NUM_STEPS - 1) {
+            f64 te = timer_now_seconds();
+            f32 val_sum = 0.0f;
+            for (u32 vb = 0; vb < VAL_BATCHES; vb++) {
+                for (u32 w = 0; w < BATCH_SEQS; w++) {
+                    u64 start = train_tokens + ((u64)vb * BATCH_SEQS + w) * val_stride;
+                    for (u32 t = 0; t < SEQ_LEN; t++) {
+                        batch_ids[(u64)w * SEQ_LEN + t] = tokens[start + t];
+                        batch_tgt[(u64)w * SEQ_LEN + t] = tokens[start + t + 1];
+                    }
+                }
+                val_sum += gpu_trainer_eval_loss(&gt, batch_ids, batch_tgt);
+            }
+            f32 val_loss = val_sum / (f32)VAL_BATCHES;
+            console_write("  [dogrulama] adim "); console_write_u64(step + 1);
+            console_write(" | val_kayip="); write_fixed3((f64)val_loss);
+            console_write(" | en_iyi="); write_fixed3(best_val < 1e38f ? (f64)best_val : 0.0);
+            console_write(" | sure="); write_fixed3(timer_now_seconds() - te); console_write_line(" sn");
+            t_train0 += timer_now_seconds() - te; /* dogrulama suresi sn/adim olcumune girmesin */
+
+            if (val_loss < best_val) {
+                gpu_trainer_download(&gt, params, &opt);
+                if (checkpoint_save(CKPT_BEST_PATH, params, num_params, &opt)) {
+                    best_val = val_loss;
+                    FileHandle bf = file_open_write(BEST_VAL_PATH);
+                    if (bf.valid) { file_write(&bf, &best_val, sizeof(f32)); file_close(&bf); }
+                    console_write_line("  [en iyi model kaydedildi]");
+                } else {
+                    console_write("  [HATA] en iyi model KAYDEDILEMEDI: "); console_write_line(CKPT_BEST_PATH);
+                }
+            }
         }
 
         if (step > 0 && (step % CKPT_EVERY == 0)) {
