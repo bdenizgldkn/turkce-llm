@@ -42,13 +42,31 @@ f64 pcg_uniform_open(PCGState* rng) {
     return u;
 }
 
+static u64 pcg_next_u64(PCGState* rng) {
+    u64 hi_bits = (u64)pcg_next_u32(rng);
+    u64 lo_bits = (u64)pcg_next_u32(rng);
+    return (hi_bits << 32) | lo_bits;
+}
+
 i64 pcg_range_i64(PCGState* rng, i64 lo, i64 hi) {
-    /* [lo, hi) -- basit modulo yontemi (kucuk-orta araliklar icin yeterli,
-     * agirlikli veri karistirma ihtiyacimiz icin modulo sapmasi ihmal
-     * edilebilir duzeydedir). */
+    /* [lo, hi) -- yansiz (unbiased) aralik ornekleme. Onceki surum duz
+     * "v % range" kullaniyordu: range, 2^32'yi tam bolmedigi zaman (ki
+     * neredeyse hicbir zaman bolmez) [0, 2^32 mod range) bandindaki
+     * degerler diger degerlerden daha sik secilir -- egitim veri
+     * karistirmasinda gercek bir sapmaya yol acan bug budur (bkz.
+     * PROJE_PLANI.md, kod incelemesi bolumu). Duzeltme: esik altindaki
+     * degerleri reddederek (rejection sampling) kalan uzayin range'e
+     * tam bolunmesini sagliyoruz -- 64-bit cekilerek gelecekte 4 milyar+
+     * token'lik korpuslarda da (500M parametre hedefi icin planlanan
+     * ~10 milyar token) dogru calisir. */
     u64 range = (u64)(hi - lo);
-    u32 v = pcg_next_u32(rng);
-    return lo + (i64)((u64)v % range);
+    if (range == 0) return lo;
+    u64 threshold = (u64)(-(i64)range) % range; /* = (2^64 - range) % range, tasma guvenli */
+    u64 v;
+    do {
+        v = pcg_next_u64(rng);
+    } while (v < threshold);
+    return lo + (i64)(v % range);
 }
 
 f64 pcg_gaussian_std(PCGState* rng) {

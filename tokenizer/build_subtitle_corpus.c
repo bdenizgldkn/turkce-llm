@@ -76,7 +76,6 @@ static u64   g_prev_len;
 
 static FileHandle g_out;
 static PCGState   g_rng;
-static bool32     g_last_block_written;
 static u64 g_stat_lines_in, g_stat_lines_kept, g_stat_blocks, g_stat_blocks_dup, g_stat_blocks_sampled_out, g_stat_bytes_out;
 
 static void flush_block(void) {
@@ -86,7 +85,6 @@ static void flush_block(void) {
     bool32 is_dup = (g_block_long > 0 && g_block_long_dup * 2 > g_block_long);
     if (is_dup) {
         g_stat_blocks_dup++;
-        g_last_block_written = FALSE;
     } else {
         /* Blogun uzun satirlarini "goruldu" olarak isaretle (ayni blok
          * icinde tekrar eden satirlar yukarida zaten sayildi). */
@@ -98,14 +96,21 @@ static void flush_block(void) {
             }
         }
         if (pcg_range_i64(&g_rng, 0, 1000) < (i64)KEEP_PERMILLE) {
-            if (!g_last_block_written && g_stat_bytes_out > 0) file_write(&g_out, "\n", 1);
+            /* Bloklar arasina HER ZAMAN ikinci bir '\n' ekleniyor (blok
+             * zaten kendi son satirindan gelen tek '\n' ile bitiyor) --
+             * boylece blok siniri "\n\n" ile ic-blok satir sonlarindan
+             * ("\n") ayirt edilebilir hale geliyor. tokenize_corpus bu
+             * "\n\n" izini <eos> tokenine ceviriyor (bkz. PROJE_PLANI.md,
+             * kod incelemesi bolumu, madde 4). Not: burada "blok" 200
+             * girdi satirlik bir pencere, gercek film siniri degil (girdi
+             * dokumunde film sinirlari isaretsiz) -- yani bu, gercek belge
+             * sinirinin YAKLASIK bir vekili; hicbir isaretten iyidir. */
+            if (g_stat_bytes_out > 0) file_write(&g_out, "\n", 1);
             file_write(&g_out, g_block, g_block_len);
             g_stat_bytes_out += g_block_len;
             g_stat_lines_kept += g_block_lines;
-            g_last_block_written = TRUE;
         } else {
             g_stat_blocks_sampled_out++;
-            g_last_block_written = FALSE;
         }
     }
     g_block_len = 0; g_block_lines = 0; g_block_long = 0; g_block_long_dup = 0;

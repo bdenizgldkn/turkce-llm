@@ -19,6 +19,13 @@ u64 xml_unescape(const char* in, u64 in_len, char* out) {
             if (at(in, i, in_len, "&amp;"))  { out[o++] = '&';  i += 5; continue; }
             if (at(in, i, in_len, "&quot;")) { out[o++] = '"';  i += 6; continue; }
             if (at(in, i, in_len, "&apos;")) { out[o++] = '\''; i += 6; continue; }
+            /* &nbsp; -- adi bir XML/HTML varligi degil (numerik &#160;
+             * degil), yukaridaki hicbir dal eslemiyordu, harf harf
+             * degismeden kopyalanip metinde ciplak "&nbsp;" kalintisi
+             * birakiyordu (bkz. PROJE_PLANI.md, kod incelemesi bolumu,
+             * madde 5). Egitim/token uretimi icin normal bosluktan
+             * ayirt edilmesine gerek yok -- duz bosluga cevriliyor. */
+            if (at(in, i, in_len, "&nbsp;")) { out[o++] = ' ';  i += 6; continue; }
 
             if (i + 1 < in_len && in[i + 1] == '#') {
                 u64 j = i + 2;

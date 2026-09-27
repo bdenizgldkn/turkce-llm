@@ -65,6 +65,9 @@ int main(void) {
     check_clean("&quot;Alinti&quot; ve &amp; isareti.",
                 "\"Alinti\" ve & isareti.", "xml entity cozme (quot/amp)");
 
+    check_clean("Kelime1&nbsp;Kelime2 normal.",
+                "Kelime1 Kelime2 normal.", "&nbsp; adi varligi normal bosluga cevrilmeli");
+
     console_write("Sonuc: ");
     console_write_u64(g_pass);
     console_write(" basarili, ");

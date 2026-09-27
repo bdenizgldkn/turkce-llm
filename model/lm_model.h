@@ -9,7 +9,7 @@
 #include "../runtime/prng.h"
 #include "transformer_block.h"
 
-#define LM_MAX_LAYERS 16
+#define LM_MAX_LAYERS 32 /* Faz 5 derinlestirme: 12->24 katman (bkz. PROJE_PLANI.md Bolum 19/25) */
 
 typedef struct LMModel {
     Node* embed_table; /* [vocab_size, d_model] */

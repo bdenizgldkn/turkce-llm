@@ -109,6 +109,31 @@ static void test_shuffle_is_permutation(void) {
     CHECK(changed, "prng: shuffle diziyi hic degistirmedi (kuskulu)");
 }
 
+static void test_range_unbiased_large(void) {
+    /* Kod incelemesinde bulunan gercek bug: eski "v % range" (v: 32-bit)
+     * range 2^32'yi tam bolmedigi zaman dusuk degerleri fazla temsil
+     * ediyordu. range=3 milyar secince eski kodda [0, ~1.29 milyar)
+     * bandindaki her deger 2x, ustundekiler 1x agirlik alir -- beklenen
+     * oran ~%43,17 iken eski kodla ~%60,3 cikardi. Yeni (reddetme
+     * tabanli) kod dogru orani vermeli. */
+    const i64 RANGE = 3000000000LL;
+    const i64 SPLIT = 1294967296LL; /* = RANGE - (2^32 mod RANGE) */
+    const u64 N = 2000000;
+    PCGState rng = pcg_seed(9001, 3);
+    u64 low_count = 0;
+    for (u64 i = 0; i < N; i++) {
+        i64 v = pcg_range_i64(&rng, 0, RANGE);
+        if (v < 0 || v >= RANGE) { g_fail++; continue; }
+        if (v < SPLIT) low_count++;
+    }
+    f64 frac = (f64)low_count / (f64)N;
+    f64 expected = (f64)SPLIT / (f64)RANGE; /* ~0.43166 */
+    /* Eski bug ~0.603 verirdi -- 0.02 tolerans, gercek sapmayla (0.17)
+     * karsilastirinca cok siki, ama istatistiksel gurultuyle (N=2M,
+     * std hata ~0.00035) karsilastirinca cok gevsek. */
+    check_close("pcg_range_i64: buyuk araliktaki sapma (eski bug)", frac, expected, 0.02);
+}
+
 int main(void) {
     console_write_line("=== Katman 2 (PRNG) Testleri ===");
 
@@ -116,6 +141,7 @@ int main(void) {
     test_uniform_range_and_moments();
     test_gaussian_moments();
     test_shuffle_is_permutation();
+    test_range_unbiased_large();
 
     console_write("Sonuc: ");
     console_write_u64(g_pass);

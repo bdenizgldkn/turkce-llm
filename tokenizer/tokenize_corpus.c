@@ -87,6 +87,61 @@ int main(int argc, char** argv) {
                 i += n2;
             }
 
+            if (!is_letter) {
+                /* Bosluk/noktalama parcasi -- icinde >=2 ardisik '\n'
+                 * (belge/makale siniri, bkz. build_wiki_corpus.c ve
+                 * build_subtitle_corpus.c) varsa oraya <eos> tokeni
+                 * yerlestiriyoruz. Onceden hic eos eklenmiyordu, egitim
+                 * pencereleri makale/film sinirlarindan gecip modelin
+                 * "konu sinir tanimadan surer" ogrenmesine yol aciyordu
+                 * (bkz. PROJE_PLANI.md, kod incelemesi bolumu, madde 4).
+                 * Diger tum bosluk/noktalama (tek '\n', space vb.) eskisi
+                 * gibi BPE ile kodlanmaya devam ediyor. */
+                u64 p = start;
+                while (p < i) {
+                    if (window[p] == '\n') {
+                        u64 run_start = p;
+                        while (p < i && window[p] == '\n') p++;
+                        if (p - run_start >= 2) {
+                            out_buf[out_buf_n++] = voc.eos_id;
+                            if (out_buf_n == 4096) {
+                                file_write(&out, out_buf, out_buf_n * sizeof(u32));
+                                out_buf_n = 0;
+                            }
+                            total_tokens++;
+                            continue;
+                        }
+                        p = run_start; /* tek '\n' -- asagida normal yoldan kodlanacak */
+                    }
+                    u64 piece_end = p;
+                    while (piece_end < i && !(window[piece_end] == '\n' && piece_end + 1 < i && window[piece_end + 1] == '\n')) piece_end++;
+
+                    u64 seg_start = p;
+                    while (seg_start < piece_end) {
+                        u64 seg_len = piece_end - seg_start;
+                        if (seg_len > MAX_SEGMENT) seg_len = MAX_SEGMENT;
+                        while (seg_len > 1 && seg_start + seg_len < total_len &&
+                               ((u8)window[seg_start + seg_len] & 0xC0) == 0x80) seg_len--;
+
+                        u32 ids[TOKENIZE_MAX_IDS];
+                        u32 n_ids = tokenize_word(&voc, &lex, &freq, window + seg_start, seg_len, ids);
+                        total_words_analyzed++;
+
+                        for (u32 k = 0; k < n_ids; k++) {
+                            out_buf[out_buf_n++] = ids[k];
+                            if (out_buf_n == 4096) {
+                                file_write(&out, out_buf, out_buf_n * sizeof(u32));
+                                out_buf_n = 0;
+                            }
+                        }
+                        total_tokens += n_ids;
+                        seg_start += seg_len;
+                    }
+                    p = piece_end;
+                }
+                continue;
+            }
+
             u64 seg_start = start;
             while (seg_start < i) {
                 u64 seg_len = i - seg_start;

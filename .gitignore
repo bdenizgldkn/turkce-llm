@@ -17,6 +17,8 @@ training/*.txt
 # Derlenmis programlar (uzantisiz ELF) ve Windows ciktilari
 *.exe
 *.o
+*.obj
+build_*.bat
 tests/*
 !tests/*.c
 training/*
