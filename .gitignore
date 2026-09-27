@@ -4,6 +4,9 @@ data/raw/*.bz2
 data/raw/*.bin
 data/raw/wikipedia_corpus.txt
 data/raw/tokenize_log.txt
+data/raw/opensubtitles_tr_*
+data/raw/subtitle_corpus.txt
+data/raw/subtitle_*_log.txt
 
 # Egitim ciktilari
 checkpoints/
@@ -25,3 +28,6 @@ tokenizer/*
 
 # Yedekler
 *.bak
+
+# scripts/build_all.sh nesne dosyalari
+build/

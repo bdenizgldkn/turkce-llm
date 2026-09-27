@@ -588,3 +588,26 @@ Düzeltmeler bu sunucuda **~4,1×**, laptop'a göre **~2,4×** dizi verimi getir
 - Geçiş: eğitim 26.000. adımın checkpoint'i yazılır yazılmaz durduruldu (adım kaybı yok). 128 bağlamlı en iyi model `lm_wiki_faz3_best_ctx128.bin` olarak saklandı (doğrulama kaybı 1,679); 1024 bağlamlı doğrulama kaybı farklı ölçekte olduğu için "en iyi" takibi sıfırlandı.
 
 **Ölçümler:** 1,15 sn/adım (128'de 0,90; tahmin 1,1–1,3), GPU belleği 11,5 GB. Geçişte kısa bir sıçrama (26.100: 1,896), 26.200'de eğitim kaybı 1,726 (128 bağlamdaki son değer ~1,80). **İlk 1024 doğrulama kaybı (26.500): 1,548** (128 bağlamda 1,679) — model uzun bağlamdan hemen faydalandı. Kalan ~43.500 adım ≈ 14 saat.
+
+**Faz 3 sonucu (2026-09-27):** 70.000 adım tamamlandı (~14,3 saat, ~1,0 milyar token ≈ 2 epoch). En iyi doğrulama kaybı **1,376** (adım 69.000, token başına perplexity ≈ 3,96); son 10.000 adımda iyileşme ~0,01 → bu veri/model boyutunda doygunluk. `lm_wiki_faz3_best.bin` / `lm_wiki_faz3_final.bin` GitHub Releases'ta (`faz3-final`).
+
+**Sonrasında düzeltilenler:** `generate.c`/`chat.c` var olmayan `lm_wiki_faz2_final.bin`'i yüklüyordu → `CKPT_PATH` = `lm_wiki_faz3_best.bin`. `decode_tokens`'taki 4096 baytlık geçici tampon 16 KB'lık çıktıda taşabilirdi → `tr_apply_root_change` yerinde çağrılıyor (sadece son kod noktası değişir).
+
+## 24. Faz 4 — Günlük Konuşma Devam Eğitimi: Film Altyazıları (2026-09-27)
+
+**Karar (kullanıcı ile):** Faz 3'ün en iyi modelinin üzerine film altyazılarından günlük konuşma dili eklenerek eğitime devam. Karışım **%65 altyazı / %35 Vikipedi** (unutmayı sınırlamak için), **25.000 adım** (~8 saat).
+
+**Veri: OpenSubtitles v2024 (OPUS), Türkçe tek-dilli** (`tr.txt.gz`, 2,3 GB → 7,7 GB, 247,6M satır).
+- `tokenizer/subtitle_clean.c/h` (yeni) — satır temizleyici: `<i>`/`{\an8}` etiketleri, `[GÜLER]` ses betimlemeleri (`{...]` karışık kapanış dahil), `{12345` MicroDVD kare numaraları, satır başı diyalog tireleri; **OCR hatası** (DVD altyazılarında küçük `l` → büyük `I`: "oIdu", "KiIitIendin") — küçük harften sonra gelen `I` → `l` (düzeltilmiş önceki harfe bakılır; kelime başı `I` dokunulmaz: Işık, Irmak); şarkı (♪) / harfsiz / çevirmen-site imzası satırları atılır. Çıktı girdiden asla uzun değil (ham baytlar kopyalanır). `tests/test_subtitle_clean.c` **29/29**.
+- `tokenizer/build_subtitle_corpus.c` (yeni): ardışık tekrar satırlar teke iner. **Film sürümü tekrarı:** aynı film dökümde birçok altyazı sürümüyle bulunur; girdi 200 satırlık bloklarla işlenir, bloğun uzun (≥24 bayt) satırlarının yarısından fazlası daha önce görülmüşse (64-bit FNV-1a, açık adresli tablo) blok **tümden** atılır → 1.238.085 bloğun **614.097'si (%49,6) kopya**; tekrarsız 3,84 GB. Bundan bloklar düzgün dağılımla ‰290 örneklendi → `subtitle_corpus.txt` **1,11 GB, 35,6M satır**.
+- `tokenizer/tokenize_corpus.c`: girdi/çıktı yolu argümanla (`./tokenizer/tokenize_corpus girdi.txt cikti.bin`; argümansız eski davranış). Tokenizer DEĞİŞMEDİ (vocab 31.769 — model gömme boyutu sabit); altyazıda 2,23 bayt/token.
+- Tokenize sonucu: `data/raw/subtitle_tokens.bin` **500.591.668 token** (2,23 bayt/token; tek çekirdekte ~25 dakika).
+
+**`training/train_faz4.c` (yeni; Faz 3'ün `train_lm_gpu.c`'si yeniden üretilebilir kalsın diye ayrı dosya):**
+- Başlangıç: `lm_wiki_faz3_best.bin`'in SADECE ağırlıkları; Adam sıfırdan. Devam: `lm_faz4_latest.bin` varsa ağırlık + Adam (Faz 3 ile aynı mantık).
+- Adım başına 14×1024 token (Faz 3 ile aynı): ilk **9 dizi altyazı**, son **5 dizi Vikipedi** (`gpu_trainer_sample_batch` iki kez, tohumlar 4.000.000+adım / 8.000.000+adım).
+- lr: 500 adım ısınma → kosinüs **3e-4 → 3e-5** (Faz 3 tepe değerinin yarısı); gradyan kırpma 1.0.
+- İki doğrulama seti (her korpusun son %1'i, Faz 3 ile aynı pencere düzeni): altyazı ve Vikipedi; "en iyi" = 0,643·altyazı + 0,357·Vikipedi (karışım oranları). Eğitimden önce başlangıç ölçümü yapılır ("en iyi" sayılmaz).
+- Checkpoint'ler: `lm_faz4_latest.bin` (1000 adımda bir), `lm_faz4_best.bin` (+ `_val.bin`), `lm_faz4_final.bin`.
+
+**Koşu:** tmux `egitim4`, log `training/faz4_log.txt`. **Başlangıç ölçümü: altyazı 2,682 / Vikipedi 1,376** (Faz 3 değeriyle birebir aynı → ağırlıklar ve doğrulama düzeni doğru). 1,16 sn/adım, GPU belleği 11,5 GB, %100 → 25.000 adım ≈ 8,1 saat.

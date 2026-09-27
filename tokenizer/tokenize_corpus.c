@@ -5,7 +5,10 @@
  * AKIS (STREAMING) TABANLI: buyuk dosyayi pencere pencere okur, kelime
  * sinirinda (bosluk karakterinde) guvenli kesim yapar.
  *
- * Cikti: data/raw/wikipedia_tokens.bin (ham u32 token ID dizisi, kucuk-endian). */
+ * Cikti: data/raw/wikipedia_tokens.bin (ham u32 token ID dizisi, kucuk-endian).
+ *
+ * Kullanim: ./tokenizer/tokenize_corpus [girdi.txt cikti.bin]
+ * (argumansiz: Vikipedi korpusu; Faz 4'te altyazi korpusu icin de kullanilir). */
 #include "../runtime/types.h"
 #include "../runtime/memory.h"
 #include "../runtime/file_io.h"
@@ -24,7 +27,9 @@ static bool32 is_ws(u8 b) {
     return b == ' ' || b == '\t' || b == '\n' || b == '\r';
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    const char* in_path = (argc > 2) ? argv[1] : "data/raw/wikipedia_corpus.txt";
+    const char* out_path = (argc > 2) ? argv[2] : "data/raw/wikipedia_tokens.bin";
     console_write_line("=== Vikipedi Korpüsünü Tokenize Etme ===");
 
     Allocator alloc = allocator_create(3000ull * 1024 * 1024);
@@ -40,9 +45,9 @@ int main(void) {
     TokenizerVocab voc = tokenizer_init(&alloc, "data/raw/bpe_merges.txt");
     console_write("Toplam vocab boyutu: "); console_write_u64(voc.vocab_size); console_write_line("");
 
-    FileHandle in = file_open_read("data/raw/wikipedia_corpus.txt");
+    FileHandle in = file_open_read(in_path);
     if (!in.valid) { console_write_line("HATA: korpüs dosyasi acilamadi."); return 1; }
-    FileHandle out = file_open_write("data/raw/wikipedia_tokens.bin");
+    FileHandle out = file_open_write(out_path);
     if (!out.valid) { console_write_line("HATA: cikti dosyasi acilamadi."); return 1; }
 
     char* window = (char*)allocator_alloc(&alloc, WINDOW_SIZE + MAX_CARRY);

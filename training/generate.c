@@ -46,6 +46,7 @@
 #define D_FF         1024u
 #define CTX_MAX      1024u /* Faz 3b: model 1024 baglamla egitildi */
 #define EPS          1e-5f
+#define CKPT_PATH    "checkpoints/lm_wiki_faz3_best.bin" /* Faz 3: en dusuk dogrulama kaybi */
 
 #define NUM_GENERATE 80u
 #define TEMPERATURE  0.85f
@@ -116,10 +117,10 @@ static u64 decode_tokens(const TokenizerVocab* voc, const u32* ids, u32 n, char*
                                              s->triggers_softening, s->drop_initial_vowel_after_vowel,
                                              sfx_buf, &softened);
             if (softened != 0 && len > 0) {
-                char tmp[4096];
-                u64 new_len = tr_apply_root_change(out, len, softened, tmp);
-                for (u64 k = 0; k < new_len; k++) out[k] = tmp[k];
-                len = new_len;
+                /* Yerinde: sadece son kod noktasi degisir, onceki baytlar
+                 * kendi uzerine kopyalanir (sabit boyutlu gecici tampon
+                 * uzun metinlerde tasardi). */
+                len = tr_apply_root_change(out, len, softened, out);
             }
             for (u64 k = 0; k < sfx_len; k++) out[len++] = sfx_buf[k];
         } else if (id < voc->bpe_base + voc->bpe.num_symbols) {
@@ -135,7 +136,7 @@ static u64 decode_tokens(const TokenizerVocab* voc, const u32* ids, u32 n, char*
 }
 
 int main(void) {
-    console_write_line("=== Turkce LLM - Metin Uretimi (Faz 1 Sonucu Testi) ===");
+    console_write_line("=== Turkce LLM - Metin Uretimi (Faz 3 modeli) ===");
 
     Allocator persist = allocator_create(2ull * 1024 * 1024 * 1024);
 
@@ -156,10 +157,10 @@ int main(void) {
     u32 num_params = lm_collect_params(&model, params);
 
     Allocator scratch = allocator_create(1024ull * 1024 * 1024);
-    bool32 ok = checkpoint_load(&scratch, "checkpoints/lm_wiki_faz2_final.bin", params, num_params, NULL_PTR);
+    bool32 ok = checkpoint_load(&scratch, CKPT_PATH, params, num_params, NULL_PTR);
     allocator_destroy(&scratch);
     if (!ok) {
-        console_write_line("[HATA] Checkpoint yuklenemedi (checkpoints/lm_wiki_faz2_final.bin).");
+        console_write("[HATA] Checkpoint yuklenemedi: "); console_write_line(CKPT_PATH);
         return 1;
     }
     console_write_line("Checkpoint yuklendi.");
