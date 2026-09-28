@@ -192,6 +192,272 @@ extern "C" __global__ void k_gemm_nn(GEMM_ARGS) { gemm_body<0, 0>(GEMM_PASS); }
 extern "C" __global__ void k_gemm_nt(GEMM_ARGS) { gemm_body<0, 1>(GEMM_PASS); }
 extern "C" __global__ void k_gemm_tn(GEMM_ARGS) { gemm_body<1, 0>(GEMM_PASS); }
 
+/* ================= BF16 tensor-core GEMM (Faz 6 hiz calismasi) =================
+ * mma.sync.m16n8k16 (Ada/sm_89 destekli) ile duz FP32 CUDA cekirdegine
+ * gore olculen gercek kazanc: NN+bias+residual fuzyonu ~2,4-2,5x, NT
+ * (attention Q@K^T, banka-catismasi dolgusuyla duzeltildi) ~1,24x.
+ * TN (agirlik gradyani) BELLEK BANT GENISLIGI sinirli oldugu kanitlandi
+ * (kucuk M,N + cok buyuk K -> karo tekrari trafigi baskin, BF16 hesap
+ * hizi degil bant genisligi darbogaz oldugu icin YARDIMCI OLMUYOR) --
+ * bu yuzden TN icin FP32 (k_gemm_tn) kullanilmaya devam ediyor, buradaki
+ * TN cekirdekleri ileride baska bir yaklasim denenirse diye birakildi,
+ * su an hicbir yerden cagrilmiyor. Ayrintili olcumler icin bkz.
+ * PROJE_PLANI.md, "BF16 tensor-core arastirmasi" bolumu. */
+
+__device__ unsigned short f32_to_bf16(float f) {
+    unsigned int bits = __float_as_uint(f);
+    unsigned int rounding_bias = ((bits >> 16) & 1u) + 0x7FFFu;
+    bits += rounding_bias;
+    return (unsigned short)(bits >> 16);
+}
+
+#define BF16_BM 64
+#define BF16_BN 64
+#define BF16_BK 32
+#define BF16_WARPS_M 4
+#define BF16_WARPS_N 2
+
+/* bias == NULL ise eklenmez; residual == NULL ise eklenmez; degilse
+ * C = acc + bias + residual (transformer blogundaki "proj = w@x + b;
+ * x_out = x_in + proj" ikilisini TEK cekirdege gomer -- ayri add_bias
+ * VE ayri residual-add cekirdeklerinin bellek turu maliyetini kaldirir,
+ * bkz. olcum). Sadece NN (TA=0,TB=0), batch'siz -- QKV/WO/gate_up/down
+ * projeksiyonlarinin hepsi bu sekle uyuyor. */
+extern "C" __global__ void k_bf16_gemm_nn_bias(const float* __restrict__ A, const float* __restrict__ B,
+                                           const float* __restrict__ bias, const float* __restrict__ residual,
+                                           float* __restrict__ C, int M, int N, int K) {
+    __shared__ unsigned short As[BF16_BM][BF16_BK];
+    __shared__ unsigned short Bs[BF16_BK][BF16_BN];
+
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int warp_m = warp_id / BF16_WARPS_N;
+    int warp_n = warp_id % BF16_WARPS_N;
+
+    int m0 = blockIdx.y * BF16_BM;
+    int n0 = blockIdx.x * BF16_BN;
+
+    int groupID = lane >> 2;
+    int tig = lane & 3;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int nt = 0; nt < 4; nt++)
+        #pragma unroll
+        for (int d = 0; d < 4; d++) acc[nt][d] = 0.0f;
+
+    int tid = threadIdx.x;
+    int nthreads = BF16_WARPS_M * BF16_WARPS_N * 32;
+
+    for (int k0 = 0; k0 < K; k0 += BF16_BK) {
+        for (int idx = tid; idx < BF16_BM * BF16_BK; idx += nthreads) {
+            int m = idx / BF16_BK, k = idx % BF16_BK;
+            int gm = m0 + m, gk = k0 + k;
+            float v = (gm < M && gk < K) ? A[(long long)gm * K + gk] : 0.0f;
+            As[m][k] = f32_to_bf16(v);
+        }
+        for (int idx = tid; idx < BF16_BK * BF16_BN; idx += nthreads) {
+            int k = idx / BF16_BN, n = idx % BF16_BN;
+            int gk = k0 + k, gn = n0 + n;
+            float v = (gk < K && gn < N) ? B[(long long)gk * N + gn] : 0.0f;
+            Bs[k][n] = f32_to_bf16(v);
+        }
+        __syncthreads();
+
+        int wm0 = warp_m * 16;
+        int wn0 = warp_n * 32;
+
+        #pragma unroll
+        for (int ksub = 0; ksub < BF16_BK; ksub += 16) {
+        unsigned int a[4];
+        {
+            int rows[8] = { groupID, groupID, groupID + 8, groupID + 8, groupID, groupID, groupID + 8, groupID + 8 };
+            int cols[8] = { tig * 2 + 0, tig * 2 + 1, tig * 2 + 0, tig * 2 + 1,
+                            tig * 2 + 8, tig * 2 + 9, tig * 2 + 8, tig * 2 + 9 };
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                unsigned short lo = As[wm0 + rows[2 * r]][ksub + cols[2 * r]];
+                unsigned short hi = As[wm0 + rows[2 * r + 1]][ksub + cols[2 * r + 1]];
+                a[r] = (unsigned int)lo | ((unsigned int)hi << 16);
+            }
+        }
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            int n_base = wn0 + nt * 8;
+            unsigned int b[2];
+            int rows[4] = { tig * 2 + 0, tig * 2 + 1, tig * 2 + 8, tig * 2 + 9 };
+            #pragma unroll
+            for (int r = 0; r < 2; r++) {
+                unsigned short lo = Bs[ksub + rows[2 * r]][n_base + groupID];
+                unsigned short hi = Bs[ksub + rows[2 * r + 1]][n_base + groupID];
+                b[r] = (unsigned int)lo | ((unsigned int)hi << 16);
+            }
+            float c[4] = { acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3] };
+            float d[4];
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                  "r"(b[0]), "r"(b[1]),
+                  "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+            #pragma unroll
+            for (int d2 = 0; d2 < 4; d2++) acc[nt][d2] = d[d2];
+        }
+        }
+        __syncthreads();
+    }
+
+    int wm0 = warp_m * 16;
+    int wn0 = warp_n * 32;
+    int drows[4] = { groupID, groupID, groupID + 8, groupID + 8 };
+    int dcols[4] = { tig * 2 + 0, tig * 2 + 1, tig * 2 + 0, tig * 2 + 1 };
+    #pragma unroll
+    for (int nt = 0; nt < 4; nt++) {
+        int n_base = wn0 + nt * 8;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int gm = m0 + wm0 + drows[i];
+            int gn = n0 + n_base + dcols[i];
+            if (gm < M && gn < N) {
+                long long off = (long long)gm * N + gn;
+                float v = acc[nt][i] + (bias ? bias[gn] : 0.0f);
+                if (residual) v += residual[off];
+                C[off] = v;
+            }
+        }
+    }
+}
+
+/* Genel amacli (TA/TB, batch, alpha/beta) BF16 GEMM -- FP32 gemm_body ile
+ * AYNI arayuz. Attention Q@K^T (NT) icin kullaniliyor. TBM/TBN/TWM/TWN
+ * sablon parametreleri, ileride baska sekiller icin farkli karo
+ * denemeye izin veriyor (bkz. k_bf16_gemm_tn_small, su an cagrilmiyor). */
+template <int TA, int TB, int TBM, int TBN, int TWM, int TWN>
+__device__ void bf16_gemm_body(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+                                int M, int N, int K, int lda, int ldb, int ldc,
+                                long long strideA, long long strideB, long long strideC,
+                                float alpha, float beta) {
+    /* +2 dolgu: TA=1/TB=1 durumunda ardisik thread'lerin ardisik m/n'e
+     * (BK/TBN kadar sabit stride'la) yazmasi banka hizalanmasina (BK=32,
+     * guc-of-2) denk gelip banka catismasina yol acabiliyordu -- dolgu
+     * bu hizalanmayi bozar (NT icin ~1,24x'e cikaran gercek duzeltme). */
+    __shared__ unsigned short As[TBM][BF16_BK + 2];
+    __shared__ unsigned short Bs[BF16_BK][TBN + 2];
+
+    A += (long long)blockIdx.z * strideA;
+    B += (long long)blockIdx.z * strideB;
+    C += (long long)blockIdx.z * strideC;
+
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int warp_m = warp_id / TWN;
+    int warp_n = warp_id % TWN;
+
+    int m0 = blockIdx.y * TBM;
+    int n0 = blockIdx.x * TBN;
+
+    int groupID = lane >> 2;
+    int tig = lane & 3;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int nt = 0; nt < 4; nt++)
+        #pragma unroll
+        for (int d = 0; d < 4; d++) acc[nt][d] = 0.0f;
+
+    int tid = threadIdx.x;
+    int nthreads = TWM * TWN * 32;
+
+    for (int k0 = 0; k0 < K; k0 += BF16_BK) {
+        /* Coalescing: TA=0'da A[gm*lda+gk] icin ardisik thread -> ardisik
+         * gk; TA=1'de A[gk*lda+gm] icin ardisik thread -> ardisik gm
+         * OLMALI (yoksa saçilmis/uncoalesced global okuma, gercek
+         * olculen bir yavaslamaydi). */
+        for (int idx = tid; idx < TBM * BF16_BK; idx += nthreads) {
+            int m, k;
+            if (TA == 0) { k = idx % BF16_BK; m = idx / BF16_BK; } else { m = idx % TBM; k = idx / TBM; }
+            int gm = m0 + m, gk = k0 + k;
+            float v = 0.0f;
+            if (gm < M && gk < K) v = (TA == 0) ? A[(long long)gm * lda + gk] : A[(long long)gk * lda + gm];
+            As[m][k] = f32_to_bf16(v);
+        }
+        for (int idx = tid; idx < BF16_BK * TBN; idx += nthreads) {
+            int k, n;
+            if (TB == 0) { n = idx % TBN; k = idx / TBN; } else { k = idx % BF16_BK; n = idx / BF16_BK; }
+            int gk = k0 + k, gn = n0 + n;
+            float v = 0.0f;
+            if (gk < K && gn < N) v = (TB == 0) ? B[(long long)gk * ldb + gn] : B[(long long)gn * ldb + gk];
+            Bs[k][n] = f32_to_bf16(v);
+        }
+        __syncthreads();
+
+        int wm0 = warp_m * 16;
+        int wn0 = warp_n * 32;
+
+        #pragma unroll
+        for (int ksub = 0; ksub < BF16_BK; ksub += 16) {
+        unsigned int a[4];
+        {
+            int rows[8] = { groupID, groupID, groupID + 8, groupID + 8, groupID, groupID, groupID + 8, groupID + 8 };
+            int cols[8] = { tig * 2 + 0, tig * 2 + 1, tig * 2 + 0, tig * 2 + 1,
+                            tig * 2 + 8, tig * 2 + 9, tig * 2 + 8, tig * 2 + 9 };
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                unsigned short lo = As[wm0 + rows[2 * r]][ksub + cols[2 * r]];
+                unsigned short hi = As[wm0 + rows[2 * r + 1]][ksub + cols[2 * r + 1]];
+                a[r] = (unsigned int)lo | ((unsigned int)hi << 16);
+            }
+        }
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            int n_base = wn0 + nt * 8;
+            unsigned int b[2];
+            int rows[4] = { tig * 2 + 0, tig * 2 + 1, tig * 2 + 8, tig * 2 + 9 };
+            #pragma unroll
+            for (int r = 0; r < 2; r++) {
+                unsigned short lo = Bs[ksub + rows[2 * r]][n_base + groupID];
+                unsigned short hi = Bs[ksub + rows[2 * r + 1]][n_base + groupID];
+                b[r] = (unsigned int)lo | ((unsigned int)hi << 16);
+            }
+            float c[4] = { acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3] };
+            float d[4];
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                  "r"(b[0]), "r"(b[1]),
+                  "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+            #pragma unroll
+            for (int d2 = 0; d2 < 4; d2++) acc[nt][d2] = d[d2];
+        }
+        }
+        __syncthreads();
+    }
+
+    int wm0 = warp_m * 16;
+    int wn0 = warp_n * 32;
+    int drows[4] = { groupID, groupID, groupID + 8, groupID + 8 };
+    int dcols[4] = { tig * 2 + 0, tig * 2 + 1, tig * 2 + 0, tig * 2 + 1 };
+    #pragma unroll
+    for (int nt = 0; nt < 4; nt++) {
+        int n_base = wn0 + nt * 8;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int gm = m0 + wm0 + drows[i];
+            int gn = n0 + n_base + dcols[i];
+            if (gm < M && gn < N) {
+                float* c = &C[(long long)gm * ldc + gn];
+                *c = (beta == 0.0f) ? alpha * acc[nt][i] : alpha * acc[nt][i] + beta * (*c);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void k_bf16_gemm_nn(GEMM_ARGS) { bf16_gemm_body<0, 0, BF16_BM, BF16_BN, BF16_WARPS_M, BF16_WARPS_N>(GEMM_PASS); }
+extern "C" __global__ void k_bf16_gemm_nt(GEMM_ARGS) { bf16_gemm_body<0, 1, BF16_BM, BF16_BN, BF16_WARPS_M, BF16_WARPS_N>(GEMM_PASS); }
+extern "C" __global__ void k_bf16_gemm_tn(GEMM_ARGS) { bf16_gemm_body<1, 0, BF16_BM, BF16_BN, BF16_WARPS_M, BF16_WARPS_N>(GEMM_PASS); }
+extern "C" __global__ void k_bf16_gemm_tn_small(GEMM_ARGS) { bf16_gemm_body<1, 0, 32, 32, 2, 1>(GEMM_PASS); }
+
 /* ================= Blok ici indirgeme yardimcisi ================= */
 /* Sabit sirali agac indirgemesi (deterministik). blockDim.x 2'nin kuvveti
  * olmalidir; buf en az blockDim.x eleman. Sonuc TUM thread'lere doner. */

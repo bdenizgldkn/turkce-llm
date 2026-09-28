@@ -47,6 +47,7 @@ typedef struct GpuLayerActs {
 typedef struct GpuTrainer {
     CudaCtx cuda;
     CUfunction k_gemm_nn, k_gemm_nt, k_gemm_tn;
+    CUfunction k_bf16_gemm_nn_bias, k_bf16_gemm_nn, k_bf16_gemm_nt, k_bf16_gemm_tn; /* bkz. PROJE_PLANI.md BF16 arastirmasi */
     CUfunction k_add_bias_rows, k_add, k_colsum_acc;
     CUfunction k_rmsnorm_fwd, k_rmsnorm_bwd;
     CUfunction k_qkv_rope_split, k_qkv_rope_merge_bwd;

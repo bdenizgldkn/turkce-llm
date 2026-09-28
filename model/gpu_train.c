@@ -62,14 +62,52 @@ static void gemm1(GpuTrainer* g, GemmKind kind, CUdeviceptr A, CUdeviceptr B, CU
     gemm(g, kind, A, B, C, M, N, K, lda, ldb, N, 1, 0, 0, 0, 1.0f, beta);
 }
 
-static void add_bias(GpuTrainer* g, CUdeviceptr x, CUdeviceptr b, i32 rows, i32 cols) {
-    void* args[] = { &x, &b, &rows, &cols };
-    launch_1d(g->k_add_bias_rows, (u64)rows * (u64)cols, args);
+/* gemm()'in BF16 tensor-core surumu -- geri yayilimin girdi-gradyani
+ * (NT/NN, buyukce K) ve attention'in kucuk-K NT'si icin (bkz.
+ * PROJE_PLANI.md BF16 arastirmasi). Agirlik-gradyani (TN, kucuk M/N +
+ * cok buyuk K) BELLEK BANT GENISLIGI sinirli oldugu KANITLANDI -- o
+ * cagrilar FP32'de (gemm/gemm1) kalmaya devam ediyor, buraya TN icin de
+ * bir yol var (baska sekiller icin fayda sagliyor olabilir) ama cagiran
+ * taraf hangisinin fayda sagladigini bilerek secmeli. */
+static void bf16_gemm(GpuTrainer* g, GemmKind kind, CUdeviceptr A, CUdeviceptr B, CUdeviceptr C,
+                      i32 M, i32 N, i32 K, i32 lda, i32 ldb, i32 ldc,
+                      u32 batch, i64 sA, i64 sB, i64 sC, f32 alpha, f32 beta) {
+    CUfunction f = (kind == GEMM_NN) ? g->k_bf16_gemm_nn : (kind == GEMM_NT) ? g->k_bf16_gemm_nt : g->k_bf16_gemm_tn;
+    void* args[] = { &A, &B, &C, &M, &N, &K, &lda, &ldb, &ldc, &sA, &sB, &sC, &alpha, &beta };
+    cuda_launch(f, (u32)((N + 63) / 64), (u32)((M + 63) / 64), batch, 256, 1, 1, 0, args);
 }
 
-static void add(GpuTrainer* g, CUdeviceptr a, CUdeviceptr b, CUdeviceptr out, i64 n) {
-    void* args[] = { &a, &b, &out, &n };
-    launch_1d(g->k_add, (u64)n, args);
+static void bf16_gemm1(GpuTrainer* g, GemmKind kind, CUdeviceptr A, CUdeviceptr B, CUdeviceptr C,
+                       i32 M, i32 N, i32 K, f32 beta) {
+    i32 lda, ldb;
+    switch (kind) {
+        case GEMM_NN: lda = K; ldb = N; break;
+        case GEMM_NT: lda = K; ldb = K; break;
+        default:      lda = M; ldb = N; break;
+    }
+    bf16_gemm(g, kind, A, B, C, M, N, K, lda, ldb, N, 1, 0, 0, 0, 1.0f, beta);
+}
+
+/* C[M,N] = A[M,K]@B[K,N] + bias[N] (+ residual[M,N] eger residual!=0 ise),
+ * TEK cekirdekte (bkz. PROJE_PLANI.md BF16 arastirmasi -- ayri add_bias/
+ * add cekirdeklerinin bellek turu maliyetini kaldirir, gercek olculen
+ * ~2,4-2,5x). Sadece NN, batch'siz -- QKV/WO/gate_up/down projeksiyonlari
+ * hep bu sekilde. residual=0 ise eklenmez. */
+static void bf16_gemm_bias(GpuTrainer* g, CUdeviceptr A, CUdeviceptr B, CUdeviceptr bias, CUdeviceptr residual,
+                            CUdeviceptr C, i32 M, i32 N, i32 K) {
+    void* args[] = { &A, &B, &bias, &residual, &C, &M, &N, &K };
+    cuda_launch(g->k_bf16_gemm_nn_bias, (u32)((N + 63) / 64), (u32)((M + 63) / 64), 1, 256, 1, 1, 0, args);
+}
+
+/* Attention Q@K^T icin BF16 NT (bkz. PROJE_PLANI.md -- banka-catismasi
+ * dolgusuyla duzeltildi, gercek olculen ~1,24x). gemm()'in batched/
+ * stride'li arayuzuyle AYNI, sadece cekirdek BF16. */
+static void bf16_gemm_nt_batched(GpuTrainer* g, CUdeviceptr A, CUdeviceptr B, CUdeviceptr C,
+                                  i32 M, i32 N, i32 K, i32 lda, i32 ldb, i32 ldc,
+                                  u32 batch, i64 sA, i64 sB, i64 sC) {
+    f32 alpha = 1.0f, beta = 0.0f;
+    void* args[] = { &A, &B, &C, &M, &N, &K, &lda, &ldb, &ldc, &sA, &sB, &sC, &alpha, &beta };
+    cuda_launch(g->k_bf16_gemm_nt, (u32)((N + 63) / 64), (u32)((M + 63) / 64), batch, 256, 1, 1, 0, args);
 }
 
 static void colsum_acc(GpuTrainer* g, CUdeviceptr in, CUdeviceptr out, i32 rows, i32 cols) {
@@ -111,6 +149,10 @@ GpuTrainer gpu_trainer_create(Allocator* alloc, const char* ptx_path, const LMMo
     g.k_gemm_nn = cuda_get_kernel(&g.cuda, "k_gemm_nn");
     g.k_gemm_nt = cuda_get_kernel(&g.cuda, "k_gemm_nt");
     g.k_gemm_tn = cuda_get_kernel(&g.cuda, "k_gemm_tn");
+    g.k_bf16_gemm_nn_bias = cuda_get_kernel(&g.cuda, "k_bf16_gemm_nn_bias");
+    g.k_bf16_gemm_nn = cuda_get_kernel(&g.cuda, "k_bf16_gemm_nn");
+    g.k_bf16_gemm_nt = cuda_get_kernel(&g.cuda, "k_bf16_gemm_nt");
+    g.k_bf16_gemm_tn = cuda_get_kernel(&g.cuda, "k_bf16_gemm_tn");
     g.k_add_bias_rows = cuda_get_kernel(&g.cuda, "k_add_bias_rows");
     g.k_add = cuda_get_kernel(&g.cuda, "k_add");
     g.k_colsum_acc = cuda_get_kernel(&g.cuda, "k_colsum_acc");
@@ -284,47 +326,50 @@ static void gpu_forward(GpuTrainer* g, const u32* ids, const u32* targets) {
         CUdeviceptr x_out = (l + 1 < g->L) ? g->layers[l + 1].x_in : g->x_final;
 
         rmsnorm_fwd(g, a->x_in, P_(g, pidx(l, PK_ATTN_NORM)), a->n1, a->r1);
-        gemm1(g, GEMM_NN, a->n1, P_(g, pidx(l, PK_WQKV)), g->qkv, N, 3 * D, D, 0.0f);
-        add_bias(g, g->qkv, P_(g, pidx(l, PK_BQKV)), N, 3 * D);
+        /* GEMM+bias TEK cekirdekte (BF16 tensor-core, bkz. PROJE_PLANI.md
+         * BF16 arastirmasi -- gercek olculen ~2,4-2,5x). */
+        bf16_gemm_bias(g, a->n1, P_(g, pidx(l, PK_WQKV)), P_(g, pidx(l, PK_BQKV)), 0, g->qkv, N, 3 * D, D);
         {
             CUdeviceptr qkv = g->qkv, c = g->cos_t, s = g->sin_t, Q = a->Q, K = a->K, Vv = a->V;
             void* args[] = { &qkv, &c, &s, &Q, &K, &Vv, &Bi, &T, &Hi, &hd };
             launch_1d(g->k_qkv_rope_split, (u64)N * Hi * (hd / 2), args);
         }
-        /* S = Q K^T (baslik basina), sonra yerinde softmax -> P */
-        gemm(g, GEMM_NT, a->Q, a->K, a->P, T, T, hd, hd, hd, T, BH, sThd, sThd, sTT, 1.0f, 0.0f);
+        /* S = Q K^T (baslik basina, BF16 -- banka-catismasi dolgusuyla
+         * duzeltildi, gercek olculen ~1,24x), sonra yerinde softmax -> P */
+        bf16_gemm_nt_batched(g, a->Q, a->K, a->P, T, T, hd, hd, hd, T, BH, sThd, sThd, sTT);
         {
             CUdeviceptr Pp = a->P;
             void* args[] = { &Pp, &T, &scale };
             launch_rows(g->k_attn_softmax_fwd, BH * g->T, att_threads, args);
         }
+        /* P@V: K=T=1024 (attention'in Q@K^T'sindeki kucuk K=hd sorunu yok)
+         * ama henuz olculup dogrulanmadi -- tedbirle FP32'de birakildi. */
         gemm(g, GEMM_NN, a->P, a->V, g->Obuf, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
         {
             CUdeviceptr O = g->Obuf, out = a->att;
             void* args[] = { &O, &out, &Bi, &T, &Hi, &hd };
             launch_1d(g->k_heads_merge, (u64)N * D, args);
         }
-        gemm1(g, GEMM_NN, a->att, P_(g, pidx(l, PK_WO)), g->proj, N, D, D, 0.0f);
-        add_bias(g, g->proj, P_(g, pidx(l, PK_BO)), N, D);
-        add(g, a->x_in, g->proj, a->x2, (i64)N * D);
+        /* GEMM+bias+residual TEK cekirdekte -- ayri add_bias VE ayri
+         * residual-add cekirdeklerini kaldirir (uclu fuzyon, ~2,4x). */
+        bf16_gemm_bias(g, a->att, P_(g, pidx(l, PK_WO)), P_(g, pidx(l, PK_BO)), a->x_in, a->x2, N, D, D);
 
         rmsnorm_fwd(g, a->x2, P_(g, pidx(l, PK_FFN_NORM)), a->n2, a->r2);
-        gemm1(g, GEMM_NN, a->n2, P_(g, pidx(l, PK_WGU)), a->gu, N, 2 * F, D, 0.0f);
-        add_bias(g, a->gu, P_(g, pidx(l, PK_BGU)), N, 2 * F);
+        bf16_gemm_bias(g, a->n2, P_(g, pidx(l, PK_WGU)), P_(g, pidx(l, PK_BGU)), 0, a->gu, N, 2 * F, D);
         {
             CUdeviceptr gu = a->gu, h = a->h;
             void* args[] = { &gu, &h, &N, &F };
             launch_1d(g->k_swiglu_fwd, (u64)N * F, args);
         }
-        gemm1(g, GEMM_NN, a->h, P_(g, pidx(l, PK_WDOWN)), g->proj, N, D, F, 0.0f);
-        add_bias(g, g->proj, P_(g, pidx(l, PK_BDOWN)), N, D);
-        add(g, a->x2, g->proj, x_out, (i64)N * D);
+        bf16_gemm_bias(g, a->h, P_(g, pidx(l, PK_WDOWN)), P_(g, pidx(l, PK_BDOWN)), a->x2, x_out, N, D, F);
     }
 
     u32 p_final = pidx(g->L, 0); /* = 1 + 10*L */
     rmsnorm_fwd(g, g->x_final, P_(g, p_final), g->nf, g->rf);
-    /* logits = nf @ E^T (bagli cikis projeksiyonu) */
-    gemm1(g, GEMM_NT, g->nf, P_(g, 0), g->logits, N, V, D, 0.0f);
+    /* logits = nf @ E^T (bagli cikis projeksiyonu, BF16 -- K=D=384, NN/NT
+     * projeksiyonlariyla ayni sinif, buyuk N (vocab) blok sayisini zaten
+     * yeterince artiriyor). */
+    bf16_gemm1(g, GEMM_NT, g->nf, P_(g, 0), g->logits, N, V, D, 0.0f);
     {
         CUdeviceptr lg = g->logits, tg = g->targets, lr = g->loss_rows;
         f32 grad_scale = 1.0f / (f32)N;
@@ -346,9 +391,11 @@ static void gpu_backward(GpuTrainer* g) {
     u32 p_final = pidx(g->L, 0);
 
     /* ===== geri ===== */
-    /* logits artik dL/dlogits. dE += dlogits^T @ nf ; dnf = dlogits @ E */
+    /* logits artik dL/dlogits. dE += dlogits^T @ nf (agirlik-gradyani,
+     * TN -- bellek bant genisligi sinirli kanitlandi, FP32'de kaliyor);
+     * dnf = dlogits @ E (NN, K=V buyuk -- BF16 iyi aday). */
     gemm1(g, GEMM_TN, g->logits, g->nf, G_(g, 0), V, D, N, 1.0f);
-    gemm1(g, GEMM_NN, g->logits, P_(g, 0), g->dn, N, D, V, 0.0f);
+    bf16_gemm1(g, GEMM_NN, g->logits, P_(g, 0), g->dn, N, D, V, 0.0f);
     cuda_memset_zero(g->dres, (u64)N * D * F4);
     rmsnorm_bwd(g, g->x_final, P_(g, p_final), g->rf, g->dn, g->dres, G_(g, p_final));
 
@@ -356,10 +403,14 @@ static void gpu_backward(GpuTrainer* g) {
         GpuLayerActs* a = &g->layers[l];
         u32 ul = (u32)l;
 
-        /* --- FFN: x3 = x2 + (h @ Wd + bd); dres = dx3 --- */
+        /* --- FFN: x3 = x2 + (h @ Wd + bd); dres = dx3 ---
+         * Agirlik-gradyani (TN, kucuk M/N + cok buyuk K=N_tokens) BELLEK
+         * BANT GENISLIGI sinirli kanitlandi -- FP32'de kaliyor. Girdi-
+         * gradyani (NT, K=D/2F -- buyukce, forward'daki iyi calisan
+         * sekillerle ayni sinif) BF16'ya cevrildi. */
         gemm1(g, GEMM_TN, a->h, g->dres, G_(g, pidx(ul, PK_WDOWN)), F, D, N, 1.0f);
         colsum_acc(g, g->dres, G_(g, pidx(ul, PK_BDOWN)), N, D);
-        gemm1(g, GEMM_NT, g->dres, P_(g, pidx(ul, PK_WDOWN)), g->dh, N, F, D, 0.0f);
+        bf16_gemm1(g, GEMM_NT, g->dres, P_(g, pidx(ul, PK_WDOWN)), g->dh, N, F, D, 0.0f);
         {
             CUdeviceptr gu = a->gu, dh = g->dh, dgu = g->dgu;
             void* args[] = { &gu, &dh, &dgu, &N, &F };
@@ -367,30 +418,35 @@ static void gpu_backward(GpuTrainer* g) {
         }
         gemm1(g, GEMM_TN, a->n2, g->dgu, G_(g, pidx(ul, PK_WGU)), D, 2 * F, N, 1.0f);
         colsum_acc(g, g->dgu, G_(g, pidx(ul, PK_BGU)), N, 2 * F);
-        gemm1(g, GEMM_NT, g->dgu, P_(g, pidx(ul, PK_WGU)), g->dn, N, D, 2 * F, 0.0f);
+        bf16_gemm1(g, GEMM_NT, g->dgu, P_(g, pidx(ul, PK_WGU)), g->dn, N, D, 2 * F, 0.0f);
         rmsnorm_bwd(g, a->x2, P_(g, pidx(ul, PK_FFN_NORM)), a->r2, g->dn, g->dres, G_(g, pidx(ul, PK_FFN_NORM)));
         /* dres artik dx2 */
 
         /* --- Dikkat: x2 = x + (att @ Wo + bo) --- */
         gemm1(g, GEMM_TN, a->att, g->dres, G_(g, pidx(ul, PK_WO)), D, D, N, 1.0f);
         colsum_acc(g, g->dres, G_(g, pidx(ul, PK_BO)), N, D);
-        gemm1(g, GEMM_NT, g->dres, P_(g, pidx(ul, PK_WO)), g->datt, N, D, D, 0.0f);
+        bf16_gemm1(g, GEMM_NT, g->dres, P_(g, pidx(ul, PK_WO)), g->datt, N, D, D, 0.0f);
         {
             CUdeviceptr dout = g->datt, dO = g->dO;
             void* args[] = { &dout, &dO, &Bi, &T, &Hi, &hd };
             launch_1d(g->k_heads_split, (u64)N * D, args);
         }
-        /* O = P V:  dV = P^T dO ; dP = dO V^T */
-        gemm(g, GEMM_TN, a->P, g->dO, g->dV, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
-        gemm(g, GEMM_NT, g->dO, a->V, g->dP, T, T, hd, hd, hd, T, BH, sThd, sThd, sTT, 1.0f, 0.0f);
+        /* O = P V:  dV = P^T dO (TN, K=T=1024 -- agirlik-gradyani DEGIL,
+         * M/N kucuk+K-cok-buyuk memory-bound deseni degil, deneysel
+         * BF16); dP = dO V^T (NT, K=hd=64 -- attention'in Q@K^T'siyle
+         * AYNI sekil, ayni banka-catismasi duzeltmesiyle BF16 fayda
+         * sagliyordu, ~1,24x). */
+        bf16_gemm(g, GEMM_TN, a->P, g->dO, g->dV, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
+        bf16_gemm(g, GEMM_NT, g->dO, a->V, g->dP, T, T, hd, hd, hd, T, BH, sThd, sThd, sTT, 1.0f, 0.0f);
         {
             CUdeviceptr Pp = a->P, dP = g->dP;
             void* args[] = { &Pp, &dP, &T, &scale };
             launch_rows(g->k_attn_softmax_bwd, BH * g->T, att_threads, args);
         }
-        /* S = Q K^T:  dQ = dS K ; dK = dS^T Q */
-        gemm(g, GEMM_NN, g->dP, a->K, g->dQ, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
-        gemm(g, GEMM_TN, g->dP, a->Q, g->dK, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
+        /* S = Q K^T:  dQ = dS K (NN, K=T=1024 -- buyuk, iyi aday);
+         * dK = dS^T Q (TN, K=T=1024 -- dV ile ayni deneysel durum). */
+        bf16_gemm(g, GEMM_NN, g->dP, a->K, g->dQ, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
+        bf16_gemm(g, GEMM_TN, g->dP, a->Q, g->dK, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
         {
             CUdeviceptr dQ = g->dQ, dK = g->dK, dV = g->dV, c = g->cos_t, s = g->sin_t, dqkv = g->dqkv;
             void* args[] = { &dQ, &dK, &dV, &c, &s, &dqkv, &Bi, &T, &Hi, &hd };
@@ -398,7 +454,7 @@ static void gpu_backward(GpuTrainer* g) {
         }
         gemm1(g, GEMM_TN, a->n1, g->dqkv, G_(g, pidx(ul, PK_WQKV)), D, 3 * D, N, 1.0f);
         colsum_acc(g, g->dqkv, G_(g, pidx(ul, PK_BQKV)), N, 3 * D);
-        gemm1(g, GEMM_NT, g->dqkv, P_(g, pidx(ul, PK_WQKV)), g->dn, N, D, 3 * D, 0.0f);
+        bf16_gemm1(g, GEMM_NT, g->dqkv, P_(g, pidx(ul, PK_WQKV)), g->dn, N, D, 3 * D, 0.0f);
         rmsnorm_bwd(g, a->x_in, P_(g, pidx(ul, PK_ATTN_NORM)), a->r1, g->dn, g->dres, G_(g, pidx(ul, PK_ATTN_NORM)));
         /* dres artik bu katmanin girdisinin gradyani */
     }

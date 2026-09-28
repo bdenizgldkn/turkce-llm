@@ -110,14 +110,22 @@ static void run_case(const CaseCfg* c) {
 
     console_write("  kayip CPU="); console_write_u64((u64)(cpu_loss * 1e6f));
     console_write(" GPU="); console_write_u64((u64)(gpu_loss * 1e6f)); console_write_line(" (x1e6)");
-    CHECK(absf(cpu_loss - gpu_loss) <= 1e-4f * absf(cpu_loss), "gpu_train: kayip CPU referansiyla eslesmiyor");
+    /* Tolerans 1e-4 -> 2e-2: ileri yayilimin cogu GEMM'i artik BF16
+     * tensor-core (bkz. PROJE_PLANI.md BF16 arastirmasi) -- bu, gercek
+     * bir hassasiyet-hiz odunlesimi (~%1-6 eleman bazinda BF16 gurultusu,
+     * kayip gibi toplu bir degerde daha kucuk kalir ama eskisi kadar
+     * sifira yakin degil). Buyuk bir sapma (>%2) yine de fragman/duzen
+     * hatasi gibi GERCEK bir bug'i yakalar. */
+    CHECK(absf(cpu_loss - gpu_loss) <= 2e-2f * absf(cpu_loss), "gpu_train: kayip CPU referansiyla eslesmiyor");
 
     /* Gradyanlar */
     gpu_trainer_download_grads(&g, params);
     f32 worst = 0.0f;
     u64 bad_total = 0;
+    /* Tolerans 2e-3 -> 8e-2: ayni gerekce (BF16 tensor-core GEMM'ler),
+     * bkz. yukarida kayip toleransindaki not. */
     for (u32 i = 0; i < np; i++) {
-        u64 bad = compare_tensor(&params[i]->grad, &ref_grad[i], 2e-3f, &worst);
+        u64 bad = compare_tensor(&params[i]->grad, &ref_grad[i], 8e-2f, &worst);
         if (bad) {
             console_write("  [FAIL] parametre "); console_write_u64(i);
             console_write(": "); console_write_u64(bad); console_write(" / ");
