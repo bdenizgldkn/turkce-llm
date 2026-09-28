@@ -92,7 +92,14 @@ static void bf16_gemm1(GpuTrainer* g, GemmKind kind, CUdeviceptr A, CUdeviceptr 
  * TEK cekirdekte (bkz. PROJE_PLANI.md BF16 arastirmasi -- ayri add_bias/
  * add cekirdeklerinin bellek turu maliyetini kaldirir, gercek olculen
  * ~2,4-2,5x). Sadece NN, batch'siz -- QKV/WO/gate_up/down projeksiyonlari
- * hep bu sekilde. residual=0 ise eklenmez. */
+ * hep bu sekilde. residual=0 ise eklenmez.
+ *
+ * NOT: A/B'yi GEMM'den ONCE ayri bir arabellege BF16 olarak cevirip
+ * karo dongusunun FP32 yerine BF16 okumasi da denendi ("bant genisligi"
+ * hipotezi) -- gercek olcumde HICBIR fark yaratmadi (1453ms ~ 1457ms,
+ * gurultu payinda), bu yuzden geri alindi. BK=32->64 denemesiyle
+ * birlikte bu, darbogazin bant genisligi OLMADIGINI gosteren ikinci
+ * bagimsiz kanit (bkz. PROJE_PLANI.md BF16 arastirmasi). */
 static void bf16_gemm_bias(GpuTrainer* g, CUdeviceptr A, CUdeviceptr B, CUdeviceptr bias, CUdeviceptr residual,
                             CUdeviceptr C, i32 M, i32 N, i32 K) {
     void* args[] = { &A, &B, &bias, &residual, &C, &M, &N, &K };

@@ -328,6 +328,14 @@ extern "C" __global__ void k_bf16_gemm_nn_bias(const float* __restrict__ A, cons
     }
 }
 
+/* DENENDI, GERI ALINDI: A/B'yi GEMM'den once ayri bir arabellege BF16
+ * olarak cevirip karo dongusunun FP32 (4 bayt) yerine BF16 (2 bayt)
+ * okumasi ("bant genisligi" hipotezi) -- gercek olcumde HICBIR fark
+ * yaratmadi (1453ms ~ 1457ms, gurultu payinda). BK=32->64 denemesiyle
+ * birlikte bu, darbogazin bant genisligi OLMADIGINI gosteren ikinci
+ * bagimsiz kanit (bkz. PROJE_PLANI.md BF16 arastirmasi). Kod
+ * sadelestirmek icin geri alindi. */
+
 /* Genel amacli (TA/TB, batch, alpha/beta) BF16 GEMM -- FP32 gemm_body ile
  * AYNI arayuz. Attention Q@K^T (NT) icin kullaniliyor. TBM/TBN/TWM/TWN
  * sablon parametreleri, ileride baska sekiller icin farkli karo
