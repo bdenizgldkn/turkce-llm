@@ -342,9 +342,8 @@ static void gpu_forward(GpuTrainer* g, const u32* ids, const u32* targets) {
             void* args[] = { &Pp, &T, &scale };
             launch_rows(g->k_attn_softmax_fwd, BH * g->T, att_threads, args);
         }
-        /* P@V: K=T=1024 (attention'in Q@K^T'sindeki kucuk K=hd sorunu yok)
-         * ama henuz olculup dogrulanmadi -- tedbirle FP32'de birakildi. */
-        gemm(g, GEMM_NN, a->P, a->V, g->Obuf, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
+        /* P@V: K=T=1024 (attention'in Q@K^T'sindeki kucuk K=hd sorunu yok). */
+        bf16_gemm(g, GEMM_NN, a->P, a->V, g->Obuf, T, hd, T, T, hd, hd, BH, sTT, sThd, sThd, 1.0f, 0.0f);
         {
             CUdeviceptr O = g->Obuf, out = a->att;
             void* args[] = { &O, &out, &Bi, &T, &Hi, &hd };
@@ -391,10 +390,10 @@ static void gpu_backward(GpuTrainer* g) {
     u32 p_final = pidx(g->L, 0);
 
     /* ===== geri ===== */
-    /* logits artik dL/dlogits. dE += dlogits^T @ nf (agirlik-gradyani,
-     * TN -- bellek bant genisligi sinirli kanitlandi, FP32'de kaliyor);
-     * dnf = dlogits @ E (NN, K=V buyuk -- BF16 iyi aday). */
-    gemm1(g, GEMM_TN, g->logits, g->nf, G_(g, 0), V, D, N, 1.0f);
+    /* dE += dlogits^T @ nf (TN, ama M=V buyuk -- kucuk-M/N+buyuk-K
+     * bellek-bound deseninden FARKLI, deneysel BF16); dnf = dlogits @ E
+     * (NN, K=V buyuk -- iyi aday). */
+    bf16_gemm1(g, GEMM_TN, g->logits, g->nf, G_(g, 0), V, D, N, 1.0f);
     bf16_gemm1(g, GEMM_NN, g->logits, P_(g, 0), g->dn, N, D, V, 0.0f);
     cuda_memset_zero(g->dres, (u64)N * D * F4);
     rmsnorm_bwd(g, g->x_final, P_(g, p_final), g->rf, g->dn, g->dres, G_(g, p_final));
